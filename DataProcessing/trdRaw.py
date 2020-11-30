@@ -6,6 +6,9 @@ import os
 
 class LocalServer: # can create some parent class like Server
     def __init__(self, dbname, host='localhost', port=27017):
+        """
+        :param dbname: database's name
+        """
         self.host = host
         self.port = port
         self.client = pymongo.MongoClient(port=port, host=host)
@@ -29,18 +32,21 @@ class LocalServer: # can create some parent class like Server
 
 class CSV:
     def __init__(self, file_path, AcctIDByMXZ, dateformat):
+        """
+        :param file_path:
+        :param AcctIDByMXZ: = '929_c_zx_6218' for PrdCode = 929
+        :param dateformat: a function that extracts date from filename
+        """
         self.path = file_path
         self.file_list = os.listdir(file_path)
         self.dateformat = dateformat
         self.acctID = AcctIDByMXZ
         return
 
-    def csv2mongo_dicts(self, file_name):
+    def csv2dicts(self, file_name):
         """
         :param file_name: csv file name
-        :param AcctIDByMXZ: = '929_c_zx_6218' for PrdCode = 929
-        :param dateformat: a function that transform filename to date
-        :return:
+        :return: a list of dictionaries to upload
         """
         date = self.dateformat(file_name)
         file_name = self.path + '/' + file_name
@@ -54,6 +60,11 @@ class CSV:
         return documents
 
     def insert(self, server, name_rules):
+        """
+        :param server: a Server class which is already connected
+        :param name_rules: the critical words in the filename by which we can understand ['fund','hold','entrust']
+        :return: None; we only upload
+        """
         fund_docs = []
         hold_docs = []
         entrust_docs = []
@@ -61,11 +72,11 @@ class CSV:
         for file in self.file_list:
             if ".csv" in file:
                 if fund_name in file:
-                    fund_docs = fund_docs+self.csv2mongo_dicts(file)
+                    fund_docs = fund_docs+self.csv2dicts(file)
                 elif hold_name in file:
-                    hold_docs = hold_docs + self.csv2mongo_dicts(file)
+                    hold_docs = hold_docs + self.csv2dicts(file)
                 elif entrust_name in file:
-                    entrust_docs = entrust_docs + self.csv2mongo_dicts(file)
+                    entrust_docs = entrust_docs + self.csv2dicts(file)
 
         server.insert('trading_rawdata_fund', fund_docs)
         server.insert('trading_rawdata_holding', hold_docs)
