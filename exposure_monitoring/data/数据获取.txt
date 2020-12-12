@@ -1,0 +1,7 @@
+用公司网线
+
+此电脑 改成 \\101.133.226.12
+
+workgroup\administrator
+Ms123456
+
