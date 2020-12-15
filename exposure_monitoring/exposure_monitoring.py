@@ -46,7 +46,7 @@ class ExposMonit:
         3.database names and collection names : trddata, basicinfo
         4.date
         """
-        w.start()
+        # w.start()
         # todo 时间最好有今天以及昨天两个，因为各个文档更新时间不同(如果今天找不到，找数据库/地址里前一天的）
         self.dt_day = datetime.datetime.today() - datetime.timedelta(days=1)
         self.str_day = self.dt_day.strftime('%Y%m%d')
@@ -57,9 +57,11 @@ class ExposMonit:
         self.db_basicinfo = self.client_mongo['basicinfo']
         self.col_acctinfo = self.db_basicinfo['acctinfo']
 
+        # self.dict_wcode2close = self.update_close_from_wind()
+
         self.path_basic_info = 'data/basic_info.xlsx'
         self.dict_future2multiplier = {'IC': 200, 'IH': 300, 'IF': 300}
-        # self.upload_basic_info()
+        self.upload_basic_info()
         # self.dirpath_data_from_trdclient
 
         self.event = threading.Event()
@@ -76,7 +78,7 @@ class ExposMonit:
                 rec.update({'DataDate': self.str_day})
                 list_records.append(rec)
             self.db_basicinfo[sheet_name].delete_many({'DataDate': self.str_day})
-            self.db_basicinfo[sheet_name].update(list_records)
+            self.db_basicinfo[sheet_name].insert_many(list_records)
         return
 
     def read_rawdata_from_trdclient(self, fpath, str_c_h_secliability_mark, data_source_type, accttype,
@@ -103,7 +105,6 @@ class ExposMonit:
 
         :return: list: 由dict rec组成的list
         """
-        # todo : 每个raw加上 AcctIDByMXZ， DataDate, UpdateTime
         # todo : 注释改进
         list_ret = []
         if str_c_h_secliability_mark == 'capital':
@@ -504,6 +505,8 @@ class ExposMonit:
                                 list_ret.append(dict_rec_holding)
 
         elif str_c_h_secliability_mark == 'secliability':
+            # todo 加上其它的有secloan的券商
+            print('Here it is')
             if data_source_type in ['zhaos_tdx'] and accttype in ['m']:
                 with open(fpath, 'rb') as f:
                     list_datalines = f.readlines()
@@ -526,6 +529,40 @@ class ExposMonit:
                             else:
                                 dict_rec_holding['交易市场'] = '沪A'
                             list_ret.append(dict_rec_holding)
+            elif data_source_type in ['zxjt_xtpb', 'zhaos_xtpb', 'zhes_xtpb', 'hf_xtpb'] and accttype in ['m']:
+                fpath = fpath.replace('YYYYMMDD', self.str_day)
+                with codecs.open(fpath, 'rb', 'gbk') as f:
+                    list_datalines = f.readlines()
+                    list_keys = list_datalines[0].strip().split(',')
+                    for dataline in list_datalines[1:]:
+                        list_values = dataline.strip().split(',')
+                        if len(list_values) == len(list_keys):
+                            dict_rec_holding = dict(zip(list_keys, list_values))
+                            if dict_rec_holding['资金账号'] == acctidbybroker:
+                                list_ret.append(dict_rec_holding)
+            elif data_source_type in ['huat_matic_tsi'] and accttype in ['m']:  # 有改动
+                fpath = fpath.replace('<YYYYMMDD>', self.str_day)
+                with codecs.open(fpath, 'rb', 'gbk') as f:
+                    list_datalines = f.readlines()
+                    list_keys = list_datalines[0].strip().split(',')
+                    for dataline in list_datalines[1:]:
+                        list_values = dataline.strip().split(',')
+                        if len(list_values) == len(list_keys):
+                            dict_rec_holding = dict(zip(list_keys, list_values))
+                            if dict_rec_holding['fund_account'] == acctidbybroker:
+                                list_ret.append(dict_rec_holding)
+            elif data_source_type in ['gtja_pluto'] and accttype in ['m']:     # 有改动
+                fpath = fpath.replace('YYYYMMDD', self.str_day)
+                with codecs.open(fpath, 'rb', 'gbk') as f:
+                    list_datalines = f.readlines()
+                    list_keys = list_datalines[0].strip().split(',')
+                    for dataline in list_datalines[1:]:
+                        list_values = dataline.strip().split(',')
+                        if len(list_values) == len(list_keys):
+                            dict_rec_holding = dict(zip(list_keys, list_values))
+                            if dict_rec_holding['单元序号'] == acctidbybroker:
+                                list_ret.append(dict_rec_holding)
+
         else:
             raise ValueError('Wrong str_c_h_secliability_mark input!')
         return list_ret
@@ -543,7 +580,7 @@ class ExposMonit:
         col_manually_rawdata_secliability = self.db_trddata['manually_rawdata_secliability']
         for _ in self.col_acctinfo.find({'DataDate': self.str_day, 'RptMark': 1}, {'_id': 0}):
             datafilepath = _['DataFilePath']
-            # print(datafilepath)
+
             if datafilepath:
                 # todo 算法上可以再稍微改进‘加速’一下，比如同一个fpath的不同 acctid一起读（一次遍历多个账户，一个文件至多读一次）
                 list_fpath_data = _['DataFilePath'][1:-1].split(',')
@@ -561,7 +598,8 @@ class ExposMonit:
                         fpath_relative = list_fpath_data[1]
                         col_manually_rawdata = col_manually_rawdata_holding
                     elif ch == 'secliability':
-                        if len(list_fpath_data) > 2:
+                        # print(len(list_fpath_data))
+                        if len(list_fpath_data) > 2:  # 3
                             fpath_relative = list_fpath_data[2]
                             if fpath_relative:
                                 col_manually_rawdata = col_manually_rawdata_secliability
@@ -667,18 +705,21 @@ class ExposMonit:
         list_codes = list_astock_codes + list_bond_codes + list_futures_codes + list_etf_codes \
             + list_repo_codes + list_mmf_codes
         err, close_data_from_wind = w.wss(list_codes, "sec_name, close", f"tradeDate={self.str_day};priceAdj=U;cycle=D", usedf=True)
+
         if err == 0:
             close_data_from_wind.rename(columns={'CLOSE': 'Close', 'SEC_NAME': 'Symbol'}, inplace=True)
             close_records = []
             for index, row in close_data_from_wind.iterrows():
                 doc = dict(row)
-                doc.update({'Wind_code': index, 'DataDate': self.str_day})
+                doc.update({'WindCode': index, 'DataDate': self.str_day})
                 close_records.append(doc)
             self.db_trddata['wind_close'].delete_many({'DataDate': self.str_day})
             self.db_trddata['wind_close'].insert_many(close_records)
+
+            return close_data_from_wind['Close'].to_dict()
         else:
             print(err, close_data_from_wind)
-        return
+            return {}
 
     def update_order_last_from_wind(self, list_secid_query):
         # we do query only for securities in our account, secid should be type of wind
@@ -686,19 +727,28 @@ class ExposMonit:
         start_time = (datetime.datetime.today()-datetime.timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
         end_time = datetime.datetime.today().strftime("%Y-%m-%d %H:%M:%S")
         docs = []
+        dict_wcode2last = {}
         for secid in list_secid_query:
-            err, last_from_wind = w.wst(secid, "last", start_time, end_time, usedf=True)
+            last_from_wind = w.wst(secid, "last", start_time, end_time)
             # 经常莫名其妙报错...service connection failed，数据也可能错...
-            if err == 0:
-                last_from_wind.rename(columns={}, inplace=True)
-                doc = dict(last_from_wind[-1])    # 需要 time, last. sec_name???
-                # todo 网好了测试一下 wst...
-                doc.update({'wind_code': secid})
+            if last_from_wind.ErrorCode == 0:
+                date_str = last_from_wind.Times[-1].strftime("%Y-%m-%d %H:%M:%S")  # datetime.datetime
+                last = last_from_wind.Data[0][-1]
+                doc = {'TransactTime': date_str, 'LastPx': last, 'wind_code': secid}  # 需要 time, last. sec_name???
                 docs.append(doc)
-            elif err != -40520004:  # service connection error
+                dict_wcode2last.update({secid: last})
+            elif last_from_wind.ErrorCode == -40520010:
+                pass   # maybe during 1 minute there's no transaction
+            else:  # service connection error
                 # or pass; or verify the data is not in wind system
-                print(err, last_from_wind)
+                print(secid, last_from_wind.ErrorCode)
         self.db_trddata['wind_last'].insert_many(docs)
+        return dict_wcode2last
+
+    def update_postdata(self):
+        # todo : 每天21：30 - 8：30之间使用
+        #  类似 updateraw，但仅仅选取上传field！
+        # 主要是security loan: short部分，其余不需要
         return
 
     @staticmethod
@@ -743,20 +793,27 @@ class ExposMonit:
 
     def update_fmtdata(self):
 
-        # todo list: 1. 改close相关公式 2.简化函数（不必要的fields），去掉patch 3.添加新加入的 list_fields，改格式
-        #  4.last price 记录  5.postdata + last算出 short（之前的算法改动）
-        dict_wcode2close = self.db_trddata['wind_close'].find({'DataDate': self.str_day})
+        # todo list: 1. 改close相关公式, 2.简化函数（不必要的fields），去掉patch，去掉b/s
+        #  3.添加新加入的 list_fields，改格式 4.last price 获取记录  5.postdata + last算出 short（之前的算法改动）
 
         # set_index: 将WindCode列设做index, to_dict之后是:{col:{index:value}}形式数据
 
         list_dicts_acctinfo = list(
             self.col_acctinfo.find({'DataDate': self.str_day, 'RptMark': 1}, {'_id': 0}))  # {'_id': 0}隐藏
+
+        list_dicts_capital_fmtted = []
+        list_dicts_holding_fmtted = []
+        list_dicts_secliability_fmtted = []
+        list_dicts_future_captial_fmtted = []
+        list_dicts_future_position_fmtted = []
+
         for dict_acctinfo in list_dicts_acctinfo:
             prdcode = dict_acctinfo['PrdCode']
             acctidbymxz = dict_acctinfo['AcctIDByMXZ']
             accttype = dict_acctinfo['AcctType']
             if accttype in ['c', 'm', 'o']:
-                patchmark = dict_acctinfo['PatchMark']
+                # patchmark = dict_acctinfo['PatchMark']
+                # todo 有的券商的secloan要补上 - PatchMark；有的则是场外交易；还得写Patch函数
                 # 1.整理holding
                 # 1.1 rawdata(无融券合约账户)
                 list_dicts_holding = list(self.db_trddata['manually_rawdata_holding'].find(
@@ -771,13 +828,13 @@ class ExposMonit:
                     '股票余额', '拥股数量', '证券余额', '证券数量', '库存数量', '持仓数量', '参考持股', '持股数量', '当前持仓',
                     '当前余额', '实际数量', '实时余额'
                 ]
-                list_dicts_holding_fmtted = []
+
                 for dict_holding in list_dicts_holding:  # 不必 list_dicts_holding.keys()
                     secid = None
                     secidsrc = None
                     symbol = None
                     longqty = 0
-                    shortqty = 0
+                    # shortqty = 0
                     for field_secid in list_fields_secid:
                         if field_secid in dict_holding:
                             secid = str(dict_holding[field_secid])
@@ -816,8 +873,8 @@ class ExposMonit:
                     sectype = self.get_sectype_from_code(windcode)
                     if sectype == 'IrrelevantItem':
                         continue
-                    if windcode in dict_wcode2close:
-                        close = dict_wcode2close[windcode]
+                    if windcode in self.dict_wcode2close:
+                        close = self.dict_wcode2close[windcode]
                     else:
                         print(f'{windcode} not found in dict_wcode2close.')
                         close = 0
@@ -825,8 +882,6 @@ class ExposMonit:
                         print(f'{windcode} not found in dict_wcode2close.')
                         close = 0
                     longamt = close * longqty
-                    shortamt = 0
-                    netamt = longamt - shortamt
 
                     if accttype in ['c', 'f', 'o']:
                         cash_from_ss_in_holding_fmtted = None
@@ -843,27 +898,11 @@ class ExposMonit:
                         'Symbol': symbol,
                         'SecurityIDSource': secidsrc,
                         'LongQty': longqty,
-                        'ShortQty': shortqty,
+                        'ShortQty': 0,
                         'LongAmt': longamt,
-                        'ShortAmt': shortamt,
-                        'NetAmt': netamt,
-                        'CashFromShortSelling': cash_from_ss_in_holding_fmtted,
-                        'OTCContractUnitMarketValue': None,
-                        'LiabilityType': None,
-                        'Liability': 0,
-                        'LiabilityQty': None,  # 融券数量
-                        'LiabilityAmt': None,  # 融资数量
-                        'InterestRate': None,
-                        'DatedDate': None,
-                        'UnderlyingSecurityID': None,
-                        'UnderlyingSecurityIDSource': None,
-                        'UnderlyingSecurityType': None,
-                        'UnderlyingSymbol': None,
-                        'UnderlyingQty': None,
-                        'UnderlyingAmt': 0,
-                        'UnderlyingClose': None,
-                        'UnderlyingStartValue_vec': None,
-                        'Note': None
+                        'ShortAmt': 0,
+                        'NetAmt': longamt,
+                        'CashFromShortSelling': 0
                     }
                     list_dicts_holding_fmtted.append(dict_holding_fmtted)
 
@@ -871,19 +910,23 @@ class ExposMonit:
                 list_dicts_secliability = list(self.db_trddata['manually_rawdata_secliability'].find(
                     {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}, {'_id': 0}
                 ))
-                shortqty_from_ss = 0  # 注： 为余额，是未偿还额
+                shortqty_from_ss = 0  # ss = Short selling； 注： 为余额，是未偿还额
                 shortqty_from_equity_compensation = 0  # 注： 是余额
                 cash_from_ss_in_dict_secliability = 0
                 list_fields_shortqty_from_ss = ['剩余数量']
                 list_fields_shortqty_from_equity_compensation = ['权益补偿数量']  # 权益补偿数量，来自于股票分红，zhaos_tdx中该值为余额
                 list_fields_ss_avgprice = ['卖均价']
                 list_fields_cash_from_short_selling = ['融券卖出成本']  # CashFromShortSelling
+                list_fields_shortqty = ['real_compact_amount','未还负债数量', '未还合约数量']
+
+                list_secid_query = []
 
                 for dict_secliability in list_dicts_secliability:
                     secid = None
                     secidsrc = None
                     symbol = None
-                    longqty = 0
+                    shortqty = None
+                    # longqty = 0
                     for field_secid in list_fields_secid:
                         if field_secid in dict_secliability:
                             secid = str(dict_secliability[field_secid])
@@ -911,20 +954,24 @@ class ExposMonit:
                         if field_symbol in dict_secliability:
                             symbol = str(dict_secliability[field_symbol])
 
-                    for field_shortqty_from_ss in list_fields_shortqty_from_ss:
-                        if field_shortqty_from_ss in dict_secliability:
-                            shortqty_from_ss = float(dict_secliability[field_shortqty_from_ss])
+                    for field_shortqty in list_fields_shortqty:
+                        if field_shortqty in dict_secliability:
+                            shortqty = int(dict_secliability[field_shortqty])
+                    if not shortqty:  # not None
+                        for field_shortqty_from_ss in list_fields_shortqty_from_ss:
+                            if field_shortqty_from_ss in dict_secliability:
+                                shortqty_from_ss = float(dict_secliability[field_shortqty_from_ss])
 
-                    for field_shortqty_from_equity_compensation in list_fields_shortqty_from_equity_compensation:
-                        if field_shortqty_from_equity_compensation in dict_secliability:
-                            shortqty_from_equity_compensation = float(
-                                dict_secliability[field_shortqty_from_equity_compensation])
-                    shortqty = shortqty_from_ss + shortqty_from_equity_compensation
+                        for field_shortqty_from_equity_compensation in list_fields_shortqty_from_equity_compensation:
+                            if field_shortqty_from_equity_compensation in dict_secliability:
+                                shortqty_from_equity_compensation = float(
+                                    dict_secliability[field_shortqty_from_equity_compensation])
+                        shortqty = shortqty_from_ss + shortqty_from_equity_compensation
 
-                    for field_ss_avgprice in list_fields_ss_avgprice:
-                        if field_ss_avgprice in dict_secliability:
-                            ss_avgprice = float(dict_secliability[field_ss_avgprice])
-                            cash_from_ss_in_dict_secliability = shortqty_from_ss * ss_avgprice
+                        for field_ss_avgprice in list_fields_ss_avgprice:
+                            if field_ss_avgprice in dict_secliability:
+                                ss_avgprice = float(dict_secliability[field_ss_avgprice])
+                                cash_from_ss_in_dict_secliability = shortqty_from_ss * ss_avgprice
 
                     for field_cash_from_short_selling in list_fields_cash_from_short_selling:
                         if field_cash_from_short_selling in dict_secliability:
@@ -935,10 +982,9 @@ class ExposMonit:
                     sectype = self.get_sectype_from_code(windcode)
                     if sectype == 'IrrelevantItem':
                         continue
-                    close = dict_wcode2close[windcode]
-                    longamt = close * longqty
-                    shortamt = close * shortqty
-                    netamt = longamt - shortamt
+                    list_secid_query.append(windcode)
+                    # close = dict_wcode2close[windcode]   # 改成last...
+                    # todo 加上updateTime， 也许和holding直接并入position，不留中间过程...
                     dict_secliability_fmtted = {
                         'DataDate': self.str_day,
                         'AcctIDByMXZ': acctidbymxz,
@@ -946,307 +992,137 @@ class ExposMonit:
                         'SecurityType': sectype,
                         'Symbol': symbol,
                         'SecurityIDSource': secidsrc,
-                        'LongQty': longqty,
+                        'LongQty': 0,
                         'ShortQty': shortqty,
-                        'LongAmt': longamt,
-                        'ShortAmt': shortamt,
-                        'NetAmt': netamt,
+                        'LongAmt': 0,
+                        'ShortAmt': None,   # to calculate after we have last price
+                        'NetAmt': None,
                         'CashFromShortSelling': cash_from_ss_in_dict_secliability,
-                        'OTCContractUnitMarketValue': None,
-                        'LiabilityType': (lambda x: 'Securities Liability' if x > 0 else None)(shortamt),
-                        'Liability': shortamt,
-                        'LiabilityQty': (lambda x: x if x else None)(shortqty),  # 融券数量
-                        'LiabilityAmt': None,  # 融资数量
-                        'InterestRate': None,
-                        'DatedDate': None,
-                        'UnderlyingSecurityID': None,
-                        'UnderlyingSecurityIDSource': None,
-                        'UnderlyingSecurityType': None,
-                        'UnderlyingSymbol': None,
-                        'UnderlyingQty': None,
-                        'UnderlyingAmt': 0,
-                        'UnderlyingClose': None,
-                        'UnderlyingStartValue_vec': None,
-                        'Note': None
+                        'windcode': windcode
                     }
-                    list_dicts_holding_fmtted.append(dict_secliability_fmtted)
+                    list_dicts_secliability_fmtted.append(dict_secliability_fmtted)
 
-                # 1.2 patchdata
-                # patchdata 逻辑： 是增量补充，而不是余额覆盖
-                #   1. 检验是否有patchmark，有则进入patch算法，无则跳过。
-                #   2. 格式化patch数据
-                #   3. 将 patch data添加至holding中
-                #   3. 检查capital中各字段是否为NoneType，是则使用由holding_patchdata中推算出来的值，否则使用当前值（capital）。
-                #   4. 将rawdata 与 patchdata 相加，得到patched data。
-
-                list_dicts_holding_patchdata_fmtted = []
-
-                underlying_net_exposure = 0
-                cash_from_ss_in_patch_data = 0
-                if patchmark:
-                    list_dicts_holding_patchdata = list(self.db_trddata['manually_patchdata_holding'].find(
-                        {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}
-                    ))
-                    # todo 需改进自定义标的持仓价格和持仓金额的情况（eg.场外非标, 下层基金）
-                    for dict_holding_patchdata in list_dicts_holding_patchdata:
-                        if 'CashFromShortSelling' in dict_holding_patchdata:
-                            cash_from_ss_in_patch_data += dict_holding_patchdata['CashFromShortSelling']
-                        else:
-                            cash_from_ss_in_patch_data += 0
-                        underlying_sectype = dict_holding_patchdata['UnderlyingSecurityType']
-                        if underlying_sectype in ['CS', 'ETF', 'INDEX']:
-                            underlying_net_exposure_delta = dict_holding_patchdata['UnderlyingAmt']
-                            underlying_net_exposure += underlying_net_exposure_delta
-                        if underlying_sectype in ['Index Future']:
-                            underlying_secid = dict_holding_patchdata['UnderlyingSecurityID']
-                            underlying_index_future = underlying_secid[:2]
-                            dict_index_future2index_spot_wcode = {'IC': '000905.SH', 'IF': '000300.SH',
-                                                                  'IH': '000016.SH'}
-                            close = dict_wcode2close[dict_index_future2index_spot_wcode[underlying_index_future]]
-                            underlyingqty = dict_holding_patchdata['UnderlyingQty']
-                            dict_index_future2multiplier = {'IC': 200, 'IF': 300, 'IH': 300}
-                            multiplier = dict_index_future2multiplier[underlying_index_future]
-                            underlying_net_exposure_delta = underlyingqty * close * multiplier
-                            underlying_net_exposure += underlying_net_exposure_delta
-                        list_dicts_holding_patchdata_fmtted.append(dict_holding_patchdata)
-                list_dicts_holding_fmtted_patched = list_dicts_holding_fmtted + list_dicts_holding_patchdata_fmtted
-                for dict_holding_fmtted_patched in list_dicts_holding_fmtted_patched:
-                    prdcode = dict_holding_fmtted_patched['AcctIDByMXZ'].split('_')[0]
-                    dict_holding_fmtted_patched['PrdCode'] = prdcode
-                self.db_trddata['formatted_holding'].delete_many(
-                    {'DataDate': self.str_day, 'AcctIDByMXZ': acctidbymxz})
-                if list_dicts_holding_fmtted_patched:
-                    self.db_trddata['formatted_holding'].insert_many(list_dicts_holding_fmtted_patched)
-
-                underlying_exposure_long = 0
-                underlying_exposure_short = 0
-                if underlying_net_exposure >= 0:
-                    underlying_exposure_long = underlying_net_exposure
-                else:
-                    underlying_exposure_short = - underlying_net_exposure
-
-                # 2.整理b/s: 出于稳健性考量，股票市值由持仓数据计算得出: holding data + raw data + patch data
-                # 用现金代替可用，重点计算
-                # Cash, CashEquivalent, CompositeLongAmt, Asset, ShortAmt, Liability, ApproximateNetAsset
-                # patch data采用余额覆盖模式。（holding data采用增量添加模式）
-
-                # 2.1 holding data
-                stock_longamt = 0
-                etf_longamt = 0
-                ce_longamt = 0
-                swap_longamt = 0
-                stock_shortamt = 0
-                etf_shortamt = 0
-                flt_capital_debt = 0
-
-                if accttype in ['c', 'f', 'o']:
-                    cash_from_ss_by_acctidbymxz = None
-                elif accttype in ['m']:
-                    cash_from_ss_by_acctidbymxz = 0
-                    for dict_holding_fmtted_patched in list_dicts_holding_fmtted_patched:
-                        cash_from_ss_by_acctidbymxz += dict_holding_fmtted_patched['CashFromShortSelling']
-                else:
-                    raise ValueError('Unknown accttype.')
-
-                df_holding_fmtted_patched = pd.DataFrame(list_dicts_holding_fmtted_patched)
-                if df_holding_fmtted_patched.empty:
-                    df_holding_fmtted_patched = pd.DataFrame(
-                        columns=['DataDate', 'AcctIDByMXZ', 'CashFromSS', 'SecurityID', 'SecurityType',
-                                 'Symbol', 'SecurityIDSource',
-                                 'LongQty', 'ShortQty', 'LongAmt', 'ShortAmt', 'NetAmt', 'CashFromShortSelling',
-                                 'OTCContractUnitMarketValue', 'LiabilityType', 'Liability', 'LiabilityQty',
-                                 'LiabilityAmt',
-                                 'InterestRate', 'DatedDate', 'UnderlyingSecurityID', 'UnderlyingSecurityIDSource',
-                                 'UnderlyingSecurityType', 'UnderlyingSymbol', 'UnderlyingQty', 'UnderlyingAmt',
-                                 'UnderlyingClose', 'UnderlyingStartValue_vec', 'Note'])
-                else:
-                    df_holding_amt_sum_by_sectype = df_holding_fmtted_patched.groupby(by='SecurityType').sum()
-                    dict_amt2dict_sectype2amt = df_holding_amt_sum_by_sectype.to_dict()
-                    if 'LongAmt' in dict_amt2dict_sectype2amt:
-                        dict_sectype2longamt = dict_amt2dict_sectype2amt['LongAmt']
-                        if 'CS' in dict_sectype2longamt:
-                            stock_longamt = dict_sectype2longamt['CS']
-                        if 'ETF' in dict_sectype2longamt:
-                            etf_longamt = dict_sectype2longamt['ETF']
-                        if 'CE' in dict_sectype2longamt:
-                            ce_longamt = dict_sectype2longamt['CE']
-                        if 'SWAP' in dict_sectype2longamt:
-                            swap_longamt = dict_sectype2longamt['SWAP']
-                    if 'ShortAmt' in dict_amt2dict_sectype2amt:
-                        dict_sectype2shortamt = dict_amt2dict_sectype2amt['ShortAmt']
-                        if 'CS' in dict_sectype2shortamt:
-                            stock_shortamt = dict_sectype2shortamt['CS']
-                        if 'ETF' in dict_sectype2shortamt:
-                            etf_shortamt = dict_sectype2shortamt['ETF']
+                dict_wcode2last = self.update_order_last_from_wind(list_secid_query)
+                for dict_secliability_fmtted in list_dicts_secliability_fmtted:
+                    windcode = dict_secliability_fmtted['windcode']
+                    last = dict_wcode2last[windcode]
+                    shortqty = dict_secliability_fmtted['ShortQty']
+                    dict_secliability_fmtted['ShortAmt'] = last * shortqty
+                    dict_secliability_fmtted['NetAmt'] = - last * shortqty
+                    del dict_secliability_fmtted['windcode']
 
                 # 2.2 求cash
-                dict_capital = self.db_trddata['manually_rawdata_capital'].find_one(
+                list_dicts_capital = list(self.db_trddata['manually_rawdata_capital'].find(
                     {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}, {'_id': 0}
-                )
-                if dict_capital is None:
-                    dict_capital = {}
-                list_fields_af = ['可用', '可用数', '现金资产', '可用金额', '资金可用金', '可用余额', 'T+1指令可用金额']
+                ))  # 为啥之前find_one?
+                if list_dicts_capital is None:
+                    list_dicts_capital = []
+                list_fields_avfund = ['可用', '可用数', '现金资产', '可用金额', '资金可用金', '可用余额', 'T+1指令可用金额']
                 list_fields_ttasset = ['总资产', '资产', '总 资 产', '单元总资产', '账户总资产', '担保资产']
-                flt_ttasset = None
-                flt_cash = None
+                list_fields_cb = []     # 券商没义务提供，得从postdata里找
+                list_fields_mktvalue = []   # 券商没义务提供，得按long-short算
 
-                # 分两种情况： 1. cash acct: 至少要有cash 2. margin acct: 至少要有ttasset
-                if accttype in ['c']:
-                    for field_af in list_fields_af:
-                        if field_af in dict_capital:
-                            flt_cash = float(dict_capital[field_af])
-                        else:
-                            if patchmark:
-                                dict_patchdata_capital = (self.db_trddata['manually_patchdata_capital'].find_one(
-                                    {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}, {'_id': 0}
-                                ))
-                                if dict_patchdata_capital:
-                                    if 'Cash' in dict_patchdata_capital:
-                                        flt_cash = dict_patchdata_capital['Cash']
-                                    if 'CapitalDebt' in dict_patchdata_capital:
-                                        flt_capital_debt = dict_patchdata_capital['CapitalDebt']
+                list_dicts_capital_fmtted = []
+                for dict_capital in list_dicts_capital:
+                    cash_balance = None   # 'CashBalance'
+                    avfund = None  # 'AvailableFund'
+                    ttasset = None  # 'TotalAsset'
+                    mktvalue = None  # 'TotalMarketValue'
+                    # flt_approximate_na?
 
-                elif accttype == 'm':
-                    for field_ttasset in list_fields_ttasset:
-                        if field_ttasset in dict_capital:
-                            flt_ttasset = float(dict_capital[field_ttasset])
-                    if patchmark:
-                        dict_patchdata_capital = (self.db_trddata['manually_patchdata_capital'].find_one(
-                            {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}, {'_id': 0}
-                        ))
-                        if dict_patchdata_capital:
-                            if 'TotalAsset' in dict_patchdata_capital:
-                                if dict_patchdata_capital['TotalAsset']:
-                                    flt_ttasset = dict_patchdata_capital['TotalAsset']
-                            if 'CapitalDebt' in dict_patchdata_capital:
-                                flt_capital_debt = dict_patchdata_capital['CapitalDebt']
+                    # 分两种情况： 1. cash acct: 至少要有cash 2. margin acct: 至少要有ttasset
+                    for field_cb in list_fields_cb:
+                        if field_cb in dict_capital:
+                            cash_balance = dict_capital[field_cb]
 
-                    flt_cash = flt_ttasset - stock_longamt - etf_longamt - ce_longamt
+                    if accttype in ['c']:
+                        for field_af in list_fields_avfund:
+                            if field_af in dict_capital:
+                                avfund = float(dict_capital[field_af])
+                            else:
+                                pass
+                                # todo patchdata capital 处理 要Debt吗? - secliability 关联？
 
-                elif accttype == 'o':
-                    dict_patchdata_capital = (self.db_trddata['manually_patchdata_capital'].find_one(
-                        {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}, {'_id': 0}
-                    ))
-                    if dict_patchdata_capital:
-                        if 'Cash' in dict_patchdata_capital:
-                            flt_cash = dict_patchdata_capital['Cash']
-                        if 'CapitalDebt' in dict_patchdata_capital:
-                            flt_capital_debt = dict_patchdata_capital['CapitalDebt']
-                else:
-                    raise ValueError('Unknown accttype')
+                    elif accttype == 'm':
+                        for field_ttasset in list_fields_ttasset:
+                            if field_ttasset in dict_capital:
+                                ttasset = float(dict_capital[field_ttasset])
+                        for field_mktvalue in list_fields_mktvalue:
+                            if field_mktvalue in dict_capital:
+                                mktvalue = float(dict_capital[field_mktvalue])
+                        for field_avfund in list_fields_avfund:
+                            if field_avfund in dict_capital:
+                                avfund = float(dict_capital[field_avfund])
+                                if abs(avfund + mktvalue - ttasset) > 0.01:
+                                    print('TotalAsset does not equal to TotalMarketValue - AvailableFund')
+
+                        # flt_cash = flt_ttasset - stock_longamt - etf_longamt - ce_longamt
+
+                    elif accttype == 'o':
+                        # todo patch 里场外暂时放放
+                        pass
+                    else:
+                        raise ValueError('Unknown accttype')
+
+                    dict_capital_fmtted = {
+                        'DataDate': self.str_day,
+                        'AcctIDByMXZ': acctidbymxz,
+                        'CashBalance': cash_balance,
+                        'AvailableFund': avfund,  # flt_approximate_na?
+                        'TotalAsset': ttasset,
+                        'TotalMarketValue': mktvalue   # 总股本*每股价值 = 证券市值
+                    }
+                    list_dicts_capital_fmtted.append(dict_capital_fmtted)
 
                 # 2.3 cash equivalent: ce_longamt
-                flt_ce = ce_longamt
+                # flt_ce = ce_longamt
 
                 # 2.4 etf
-                flt_etf_long_amt = etf_longamt
+                # flt_etf_long_amt = etf_longamt
 
                 # 2.4 CompositeLongAmt
-                flt_composite_long_amt = stock_longamt
+                # flt_composite_long_amt = stock_longamt
 
-                # 2.5 SwapAmt
-                # 更新：大于0的进交易性金融资产，为资产端项目；小于0的进交易性金融负债，为负债端项目
-                flt_swap_amt2asset = 0
-                if swap_longamt > 0:
-                    flt_swap_amt2asset = swap_longamt
-                flt_swap_amt2liability = 0
-                if swap_longamt < 0:
-                    flt_swap_amt2liability = abs(swap_longamt)
+                # 2.5 SwapAmt 不考虑互换
 
                 # 2.5 Asset
-                flt_ttasset = flt_cash + flt_ce + flt_etf_long_amt + flt_composite_long_amt + flt_swap_amt2asset
+                # flt_ttasset = flt_cash + flt_ce + flt_etf_long_amt + flt_composite_long_amt + flt_swap_amt2asset
 
                 # 2.6 etf_shortamt
-                flt_etf_short_amt = etf_shortamt
+                # flt_etf_short_amt = etf_shortamt
 
                 # 2.7 stock_shortamt
-                flt_composite_short_amt = stock_shortamt
+                # flt_composite_short_amt = stock_shortamt
 
                 # 2.8 liability
                 # liability = 融券负债（利息+本金）+ 融资负债（利息+本金）+ 场外合约形成的负债（交易性金融负债）
-                if flt_capital_debt is None:
-                    flt_capital_debt = 0
-                flt_liability = (
-                        float(df_holding_fmtted_patched['Liability'].sum()) + flt_capital_debt + flt_swap_amt2liability
-                )
+                # if flt_capital_debt is None:
+                #     flt_capital_debt = 0
+                # flt_liability = (
+                #         float(df_holding_fmtted_patched['Liability'].sum()) + flt_capital_debt + flt_swap_amt2liability
+                # )
 
                 # 2.9 net_asset
-                flt_approximate_na = flt_ttasset - flt_liability
+                # flt_approximate_na = flt_ttasset - flt_liability
 
-                # 2.10 读取patchdata对rawdata进行修正: 余额覆盖模式
-                if patchmark:
-                    dict_patchdata_capital = (self.db_trddata['manually_patchdata_capital'].find_one(
-                        {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}, {'_id': 0}
-                    ))
-                    if dict_patchdata_capital:
-                        if 'Cash' in dict_patchdata_capital:
-                            if dict_patchdata_capital['Cash']:
-                                flt_cash = float(dict_patchdata_capital['Cash'])
-                        if 'CashEquivalent' in dict_patchdata_capital:
-                            if dict_patchdata_capital['CashEquivalent']:
-                                flt_ce = float(dict_patchdata_capital['CashEquivalent'])
-                        if 'ETFLongAmt' in dict_patchdata_capital:
-                            if dict_patchdata_capital['ETFLongAmt']:
-                                flt_etf_long_amt = float(dict_patchdata_capital['ETFLongAmt'])
-                        if 'CompositeLongAmt' in dict_patchdata_capital:
-                            if dict_patchdata_capital['CompositeLongAmt']:
-                                flt_composite_long_amt = float(dict_patchdata_capital['CompositeLongAmt'])
-                        if 'TotalAsset' in dict_patchdata_capital:
-                            if dict_patchdata_capital['TotalAsset']:
-                                flt_ttasset = float(dict_patchdata_capital['TotalAsset'])
-                        if 'ETFShortAmt' in dict_patchdata_capital:
-                            if dict_patchdata_capital['ETFShortAmt']:
-                                flt_etf_short_amt = float(dict_patchdata_capital['ETFShortAmt'])
-                        if 'CompositeShortAmt' in dict_patchdata_capital:
-                            if dict_patchdata_capital['CompositeShortAmt']:
-                                flt_composite_short_amt = float(dict_patchdata_capital['CompositeShortAmt'])
-                        if 'Liability' in dict_patchdata_capital:
-                            if dict_patchdata_capital['Liability']:
-                                flt_liability = float(dict_patchdata_capital['Liability'])
-                        if 'ApproximateNetAmt' in dict_patchdata_capital:
-                            if dict_patchdata_capital['ApproximateNetAmt']:
-                                flt_approximate_na = float(dict_patchdata_capital['ApproximateNetAmt'])
-                dict_bs = {
-                    'DataDate': self.str_day,
-                    'PrdCode': prdcode,
-                    'AcctIDByMXZ': acctidbymxz,
-                    'AcctType': accttype,
-                    'Cash': flt_cash,
-                    'CashEquivalent': flt_ce,
-                    'CashFromShortSelling': cash_from_ss_by_acctidbymxz,
-                    'ETFLongAmt': flt_etf_long_amt,
-                    'CompositeLongAmt': flt_composite_long_amt,
-                    'AssetFromSwap': flt_swap_amt2asset,
-                    'TotalAsset': flt_ttasset,
-                    'CapitalDebt': flt_capital_debt,
-                    'ETFShortAmt': flt_etf_short_amt,
-                    'CompositeShortAmt': flt_composite_short_amt,
-                    'LiabilityFromSwap': flt_swap_amt2liability,
-                    'Liability': flt_liability,
-                    'ApproximateNetAsset': flt_approximate_na,
-                }
-                self.db_trddata['b/s_by_acctidbymxz'].delete_many({'DataDate': self.str_day,
-                                                                   'AcctIDByMXZ': acctidbymxz})
-                list_dict_bs = [dict_bs]
-                if dict_bs:
-                    self.db_trddata['b/s_by_acctidbymxz'].insert_many(list_dict_bs)
+                # exposure_long_amt = flt_etf_long_amt + flt_composite_long_amt + underlying_exposure_long
+                # exposure_short_amt = flt_etf_short_amt + flt_composite_short_amt + underlying_exposure_short
+                # exposure_net_amt = exposure_long_amt - exposure_short_amt
 
-                exposure_long_amt = flt_etf_long_amt + flt_composite_long_amt + underlying_exposure_long
-                exposure_short_amt = flt_etf_short_amt + flt_composite_short_amt + underlying_exposure_short
-                exposure_net_amt = exposure_long_amt - exposure_short_amt
-
+            #  todo 这个部分放到position处理里
             elif accttype in ['f']:
                 # 按acctidbymxz exposure数据
                 list_dicts_holding_future = list(
                     self.db_trddata['future_api_holding'].find({'DataDate': self.str_day, 'AcctIDByMXZ': acctidbymxz})
                 )
-                list_dicts_holding_future_exposure_draft = []
+                # list_dicts_holding_future_exposure_draft = []
                 for dict_holding_future in list_dicts_holding_future:
                     secid = dict_holding_future['instrument_id']
                     secid_first_part = secid[:-4]
+                    secidsrc = dict_holding_future['exchange']
                     dict_future2spot_windcode = {'IC': '000905.SH', 'IH': '000016.SH', 'IF': '000300.SH'}
                     windcode = dict_future2spot_windcode[secid_first_part]
-                    close = dict_wcode2close[windcode]  # spot close
+                    close = self.dict_wcode2close[windcode]  # spot close
                     qty = dict_holding_future['position']
                     direction = dict_holding_future['direction']
                     future_long_qty = 0
@@ -1262,74 +1138,78 @@ class ExposMonit:
                         future_short_amt = close * future_short_qty * self.dict_future2multiplier[secid_first_part]
                     else:
                         raise ValueError('Unknown direction in future respond.')
-                    future_net_qty = future_long_qty - future_short_qty
+                    # future_net_qty = future_long_qty - future_short_qty
                     future_net_amt = future_long_amt - future_short_amt
-                    dict_holding_future_exposure_draft = {
+                    dict_future_position_fmtted= {
+                        'DataDate': self.str_day,
+                        'AcctIDByMXZ': acctidbymxz,
                         'SecurityID': secid,
-                        'direction': direction,
-                        'position': qty,
+                        'SecurityType': 'Index Future',
+                        'Symbol': None,
+                        'SecurityIDSource': secidsrc,
                         'LongQty': future_long_qty,
                         'ShortQty': future_short_qty,
-                        'NetQty': future_net_qty,
                         'LongAmt': future_long_amt,
-                        'ShortAmt': future_short_amt,
+                        'ShortAmt': future_short_amt,   # to calculate after we have last price
                         'NetAmt': future_net_amt,
+                        'CashFromShortSelling': 0   # 要算卖出赚的钱？
                     }
-                    list_dicts_holding_future_exposure_draft.append(dict_holding_future_exposure_draft)
-                if list_dicts_holding_future_exposure_draft:
-                    """一个账户的全部品种风险暴露（对IC提供的还是IH提供的未作区分）"""
-                    df_holding_future_exposure_draft = pd.DataFrame(list_dicts_holding_future_exposure_draft)
-                    exposure_long_amt = float(df_holding_future_exposure_draft['LongAmt'].sum())
-                    exposure_short_amt = float(df_holding_future_exposure_draft['ShortAmt'].sum())
-                    exposure_net_amt = exposure_long_amt - exposure_short_amt
-                else:
-                    exposure_long_amt = 0
-                    exposure_short_amt = 0
-                    exposure_net_amt = 0
-                dict_capital_future = (
-                    self.db_trddata['future_api_capital'].find_one(
-                        {'DataDate': self.str_day, 'AcctIDByMXZ': acctidbymxz}
+                    list_dicts_future_position_fmtted.append(dict_future_position_fmtted)
+                    #     list_dicts_holding_future_exposure_draft.append(dict_holding_future_exposure_draft)
+                    # if list_dicts_holding_future_exposure_draft:
+                    #     """一个账户的全部品种风险暴露（对IC提供的还是IH提供的未作区分）"""
+                    #     df_holding_future_exposure_draft = pd.DataFrame(list_dicts_holding_future_exposure_draft)
+                    #     exposure_long_amt = float(df_holding_future_exposure_draft['LongAmt'].sum())
+                    #     exposure_short_amt = float(df_holding_future_exposure_draft['ShortAmt'].sum())
+                    #     exposure_net_amt = exposure_long_amt - exposure_short_amt
+                    # else:
+                    #     exposure_long_amt = 0
+                    #     exposure_short_amt = 0
+                    #     exposure_net_amt = 0
+                list_dicts_captial_future = list(self.db_trddata['future_api_capital'].find(
+                            {'DataDate': self.str_day, 'AcctIDByMXZ': acctidbymxz}
+                        )
                     )
-                )
-                flt_approximate_na = dict_capital_future['DYNAMICBALANCE']
-                dict_future_bs = {
-                    'DataDate': self.str_day,
-                    'AcctIDByMXZ': acctidbymxz,
-                    'AcctType': 'f',
-                    'ApproximateNetAsset': flt_approximate_na,
-                    'Cash': flt_approximate_na,
-                    'CashEquivalent': 0,
-                    'CompositeLongAmt': 0,
-                    'CompositeShortAmt': 0,
-                    'ETFLongAmt': 0,
-                    'ETFShortAmt': 0,
-                    'Liability': 0,
-                    'PrdCode': prdcode,
-                    'SwapLongAmt': 0,
-                    'TotalAsset': flt_approximate_na,
-                }
-                self.db_trddata['b/s_by_acctidbymxz'].delete_many(
-                    {'DataDate': self.str_day, 'AcctIDByMXZ': acctidbymxz})
-                if dict_future_bs:
-                    self.db_trddata['b/s_by_acctidbymxz'].insert_one(dict_future_bs)
+                for dict_capital_future in list_dicts_captial_future:
+                    approximate_na = dict_capital_future['DYNAMICBALANCE']
+                    cash_balance = dict_capital_future['STATICBALANCE']
+                    acctidbymxz = dict_capital_future['AcctIDByMXZ']
+                    dict_future_capital_fmtted = {
+                        'DataDate': self.str_day,
+                        'AcctIDByMXZ': acctidbymxz,
+                        'CashBalance': cash_balance,
+                        'AvailableFund': approximate_na,  # flt_approximate_na?
+                        'TotalAsset': None,
+                        'TotalMarketValue': None  # 总股本*每股价值 = 证券市值
+                    }
+                    list_dicts_future_captial_fmtted.append(dict_future_capital_fmtted)
 
             else:
                 raise ValueError('Unknown account type in basic account info.')
+        # dict_exposure_analysis = {
+        #     'DataDate': self.str_day,
+        #     'AcctIDByMXZ': acctidbymxz,
+        #     'PrdCode': prdcode,
+        #     'LongExposure': exposure_long_amt,
+        #     'ShortExposure': exposure_short_amt,
+        #     'NetExposure': exposure_net_amt,
+        #     'ApproximateNetAsset': flt_approximate_na,
+        # }
+        # self.db_trddata['exposure_analysis_by_acctidbymxz'].delete_many({'DataDate': self.str_day,
+        #                                                                  'AcctIDByMXZ': acctidbymxz})
+        # if dict_exposure_analysis:
+        #     self.db_trddata['exposure_analysis_by_acctidbymxz'].insert_one(dict_exposure_analysis)
+        self.db_trddata['fmtdata_capital'].insert_many(list_dicts_capital_fmtted)
+        self.db_trddata['fmtdata_secliability'].insert_many(list_dicts_secliability_fmtted)
+        self.db_trddata['fmtdata_holding'].insert_many(list_dicts_holding_fmtted)
 
-            dict_exposure_analysis = {
-                'DataDate': self.str_day,
-                'AcctIDByMXZ': acctidbymxz,
-                'PrdCode': prdcode,
-                'LongExposure': exposure_long_amt,
-                'ShortExposure': exposure_short_amt,
-                'NetExposure': exposure_net_amt,
-                'ApproximateNetAsset': flt_approximate_na,
-            }
-            self.db_trddata['exposure_analysis_by_acctidbymxz'].delete_many({'DataDate': self.str_day,
-                                                                             'AcctIDByMXZ': acctidbymxz})
-            if dict_exposure_analysis:
-                self.db_trddata['exposure_analysis_by_acctidbymxz'].insert_one(dict_exposure_analysis)
+        self.db_trddata['fmtdata_position'].insert_many(list_dicts_holding_fmtted)
+        self.db_trddata['fmtdata_capital'].insert_many(list_dicts_future_captial_fmtted)
         print('Update capital and holding formatted by internal style finished.')
+        return
+
+    def exposure_analysis(self):
+
         return
 
     def run(self):
@@ -1364,9 +1244,10 @@ if __name__ == '__main__':
     # run这个文件时才会调用，import 它时则不会调用
     # 使用的test方式！
 
+    test = ExposMonit()
     # for col in test.db_trddata.list_collection_names():
     #     test.db_trddata.drop_collection(col)
-    test = ExposMonit()
+
     test.run()
     # test.upload_basic_info()
     # print('basic info uploaded!')
