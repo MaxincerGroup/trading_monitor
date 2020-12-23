@@ -14,6 +14,7 @@ from xlrd import open_workbook
 import datetime
 import time
 import functools
+import warnings
 
 # global functions and objects
 
@@ -31,19 +32,22 @@ def run_every_30s(func):
                     if func.__name__ == 'update_fmtdata':
                         while self.record_update_raw_time is None:  # 等待updateraw开始1s
                             time.sleep(1)
+                        print('34, ', self.record_update_raw_time)
                     if func.__name__ == 'update_position':
                         while self.record_fmt_time is None:  # 等待fmt开始1s
                             time.sleep(1)
-                    if func.__name__ == 'exposure_monitoring':
+                        print('37, ', self.record_fmt_time)
+                    if func.__name__ == 'exposure_analysis':
                         while self.record_position_query_time is None:  # 等待position开始1s
                             time.sleep(1)
+                        print('40, ', self.record_position_query_time)
                     self.lock.acquire()  # 只有上面三个变量可以大家都调用, 其余公共变量锁住
                     func(self, *args, **kwargs)
                     self.lock.release()
                     print('Function: ', func.__name__, 'finished')
                     time.sleep(30)
                     if func.__name__ == 'update_fmtdata':
-                        self.record_update_raw_time = '14:00:00'
+                        self.record_update_raw_time = '16:00:00'
                         print('start again')
                     # print('I am awaken!')
 
@@ -802,47 +806,50 @@ class ExposMonit:
     def get_order_last_from_wind(self, list_secid_query):
         # we do query only for securities in our account, secid should be type of wind
         # w.wsq("600000.SH", "rt_last,rt_latest", func=DemoWSQCallback)
-        docs = []
-        dict_wcode2last = {}
-        while self.record_position_query_time is None:
-            time.sleep(1)
-        # in the test mode, we monitor history last data
-            # 这个非常非常慢2000近多个证券要获得, 以后变成false
-            # start_time = self.dt_day.strftime("%Y-%m-%d") + " " + self.record_wind_query_time
-            # end_time = self.dt_day.strftime("%Y-%m-%d") + " " + self.record_position_query_time  # 在raw之后就不再None
-            # self.record_wind_query_time = self.record_position_query_time
-            # for secid in list_secid_query:
-            #     last_from_wind = w.wst(secid, "last", start_time, end_time)
-            #     # print(last_from_wind)
-            #     # 经常莫名其妙报错...service connection failed，数据也可能错...
-            #     if last_from_wind.ErrorCode == 0:
-            #         date = last_from_wind.Times[-1]  # datetime.datetime
-            #         last = last_from_wind.Data[0][-1]
-            #         print(last)
-            #         doc = {'TransactTime': date.strftime("%H:%M:%S"), 'DataDate': date.strftime("%Y%m%d"),
-            #                'LastPx': last, 'WindCode': secid}  # 需要 time, last. sec_name???
-            #         docs.append(doc)
-            #         dict_wcode2last.update({secid: last})
-            #     elif last_from_wind.ErrorCode == -40520010:  # Server Not Found Data Error
-            #         pass   # maybe there's no transaction
-            #     else:  # service connection error
-            #         # or pass; or verify the data is not in wind system
-            #         raise Exception(last_from_wind.Data)
-        last_from_wind = w.wsq(list_secid_query, "rt_last")   # 实时快照现价
-        if last_from_wind.ErrorCode == 0:
-            dict_wcode2last = dict(zip(last_from_wind.Codes, last_from_wind.Data[0]))
-            for key in dict_wcode2last:
-                date = last_from_wind.Times[0]
-                doc = {'TransactTime': date.strftime("%H:%M:%S"), 'DataDate': date.strftime("%Y%m%d"),
-                       'LastPx': dict_wcode2last[key], 'WindCode': key}
-                docs.append(doc)
-        elif last_from_wind.ErrorCode == -40520010:
-            pass
+        if list_secid_query:
+            docs = []
+            dict_wcode2last = {}
+            while self.record_position_query_time is None:
+                time.sleep(1)
+            # in the test mode, we monitor history last data
+                # 这个非常非常慢2000近多个证券要获得, 以后变成false
+                # start_time = self.dt_day.strftime("%Y-%m-%d") + " " + self.record_wind_query_time
+                # end_time = self.dt_day.strftime("%Y-%m-%d") + " " + self.record_position_query_time  # 在raw之后就不再None
+                # self.record_wind_query_time = self.record_position_query_time
+                # for secid in list_secid_query:
+                #     last_from_wind = w.wst(secid, "last", start_time, end_time)
+                #     # print(last_from_wind)
+                #     # 经常莫名其妙报错...service connection failed，数据也可能错...
+                #     if last_from_wind.ErrorCode == 0:
+                #         date = last_from_wind.Times[-1]  # datetime.datetime
+                #         last = last_from_wind.Data[0][-1]
+                #         print(last)
+                #         doc = {'TransactTime': date.strftime("%H:%M:%S"), 'DataDate': date.strftime("%Y%m%d"),
+                #                'LastPx': last, 'WindCode': secid}  # 需要 time, last. sec_name???
+                #         docs.append(doc)
+                #         dict_wcode2last.update({secid: last})
+                #     elif last_from_wind.ErrorCode == -40520010:  # Server Not Found Data Error
+                #         pass   # maybe there's no transaction
+                #     else:  # service connection error
+                #         # or pass; or verify the data is not in wind system
+                #         raise Exception(last_from_wind.Data)
+            last_from_wind = w.wsq(list_secid_query, "rt_last")   # 实时快照现价
+            if last_from_wind.ErrorCode == 0:
+                dict_wcode2last = dict(zip(last_from_wind.Codes, last_from_wind.Data[0]))
+                for key in dict_wcode2last:
+                    date = last_from_wind.Times[0]
+                    doc = {'TransactTime': date.strftime("%H:%M:%S"), 'DataDate': date.strftime("%Y%m%d"),
+                           'LastPx': dict_wcode2last[key], 'WindCode': key}
+                    docs.append(doc)
+            elif last_from_wind.ErrorCode == -40520010:
+                pass
+            else:
+                raise Exception(last_from_wind.Data[0][0])  # Error Msg here
+            if docs:
+                self.db_trddata['wind_last'].insert_many(docs)
+            return dict_wcode2last
         else:
-            raise Exception(last_from_wind.Data[0][0])  # Error Msg here
-        if docs:
-            self.db_trddata['wind_last'].insert_many(docs)
-        return dict_wcode2last
+            return {}
 
     @staticmethod
     def get_sectype_from_code(windcode):
@@ -1916,89 +1923,163 @@ class ExposMonit:
     @run_every_30s
     def update_position(self):
 
-        list_dicts_acctinfo = list(self.col_acctinfo.find({'DataDate': self.str_day, 'RptMark': 1}))
         yesterday = (self.dt_day - datetime.timedelta(days=1)).strftime("%Y%m%d")
         # print(yesterday)
-        list_dicts_position = []       # 取名改改...
-        list_windcode_used = []
-        for dict_acctinfo in list_dicts_acctinfo:
+        list_dicts_position = []  # 取名改改...
+        set_windcode_to_search = set()  # 防止重复
+        dict_id2type = {}
+        dict_pair2allcol = {}  # 为了只遍历一遍各个表格，不然特别慢！
 
+        list_dicts_acctinfo = list(self.col_acctinfo.find({'DataDate': self.str_day, 'RptMark': 1}))
+        for dict_acctinfo in list_dicts_acctinfo:
             acctidbymxz = dict_acctinfo['AcctIDByMXZ']
             # print('acctidbymxz', acctidbymxz)
             accttype = dict_acctinfo['AcctType']
+            dict_id2type.update({acctidbymxz: accttype})
+
+        for col_name in ['fmtdata_holding', 'fmtdata_order', 'future_api_holding']:
+            list_to_add = list(self.db_trddata[col_name].find(
+                {'DataDate': self.str_day, 'UpdateTime': {'$gte': self.record_fmt_time}}))
+            for _ in list_to_add:
+                if col_name != 'future_api_holding':
+                    pair = (_['AcctIDByMXZ'], _['SecurityID'], _['SecurityIDSource'],
+                            _['SecurityType'], _['Symbol'])
+                else:
+                    pair = (_['AcctIDByMXZ'], _['instrument_id'], _['exchange'])
+                # set_pair_secid = set_pair_secid | {pair}  # 并集
+                all_doc = _.copy()
+                try:
+                    dict_pair2allcol[pair][col_name].append(all_doc)
+                except KeyError:  # one key doesn't exist.
+                    dict_pair2allcol.update({pair: {col_name: [all_doc]}})
+        for col_name in ['fmtdata_holding', 'fmtdata_secloan']:
+            list_to_add = list(self.db_posttrddata[col_name].find({'DataDate': yesterday}))
+            for _ in list_to_add:
+                pair = (_['AcctIDByMXZ'], _['SecurityID'], _['SecurityIDSource'],
+                            _['SecurityType'], _['Symbol'])
+                # set_pair_secid = set_pair_secid | {pair}  # 并集
+                all_doc = _.copy()
+                col_name_ = 'post_' + col_name
+                try:
+                    dict_pair2allcol[pair][col_name_].append(all_doc)
+                except KeyError:  # one key doesn't exist.
+                    dict_pair2allcol.update({pair: {col_name_: [all_doc]}})
+
+        for pair in dict_pair2allcol:  # or pair in dict_pair2allcol.keys()
+            acctidbymxz = pair[0]
+            secid = pair[1]
+            secidsrc = pair[2]
+            accttype = dict_id2type[acctidbymxz]
+            try:
+                list_dicts_holding = dict_pair2allcol[pair]['fmtdata_holding']
+            except KeyError:  # pair may not has 'fmtdata_holding' etc key
+                list_dicts_holding = []
+            try:
+                list_dicts_post_holding = dict_pair2allcol[pair]['post_fmtdata_holding']
+            except KeyError:  # pair may not has 'fmtdata_holding' etc key
+                list_dicts_post_holding = []
+            try:
+                list_dicts_secloan = dict_pair2allcol[pair]['post_fmtdata_secloan']
+            except KeyError:  # pair may not has 'fmtdata_holding' etc key
+                list_dicts_secloan = []
+            try:
+                list_dicts_order = dict_pair2allcol[pair]['fmtdata_order']
+            except KeyError:  # pair may not has 'fmtdata_holding' etc key
+                list_dicts_order = []
+            try:
+                list_dicts_holding_future = dict_pair2allcol[pair]['future_api_holding']
+            except KeyError:  # pair may not has 'fmtdata_holding' etc key
+                list_dicts_holding_future = []
+
             if accttype in ['c', 'm', 'o'] and (not self.clearing):
-                list_dicts_holding = list(self.db_trddata['fmtdata_holding'].find(
-                    {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'UpdateTime': {'$gte': self.record_fmt_time}}))
-                # print('1946',len(list_dicts_holding))
-                list_dicts_secloan = list(self.db_posttrddata['fmtdata_secloan'].find(
-                    {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'UpdateTime': {'$gte': self.record_fmt_time}}))
-                # print('1949',len(list_dicts_secloan))
-                for dict_holding in list_dicts_holding:
-                    secid = dict_holding['SecurityID']
-                    secidsrc = dict_holding['SecurityIDSource']
-                    symbol = dict_holding['Symbol']
-                    sectype = dict_holding['SecurityType']
-                    longqty_ref = dict_holding['LongQty']
-                    longqty = 0   # longqty可能准
-                    shortqty = 0
-                    # shortamt = 0
+                symbol = pair[3]
+                sectype = pair[4]
+                windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
+                windcode = secid + windcode_suffix
 
-                    windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
-                    windcode = secid + windcode_suffix
-                    list_windcode_used.append(windcode)
+                longqty = 0  # longqty可能准
+                longqty_ref = 0
+                shortqty = 0
+                dict_holding_id = 'no reference holding'
+                dict_secloan_id = 'no reference holding'
 
-                    post_holding = list(self.db_posttrddata['fmtdata_holding'].find(
-                       {'AcctIDByMXZ': acctidbymxz, 'DataDate': yesterday, 'SecurityID': secid, 'SecurityIDSource': secidsrc}))
-                    if len(post_holding) == 1:
-                        longqty = post_holding[0]['LongQty']
-                    elif len(post_holding) == 0:
-                        pass
+                if len(list_dicts_post_holding) == 1:
+                    longqty = list_dicts_post_holding[0]['LongQty']
+                elif len(list_dicts_post_holding) == 0:
+                    pass
+                else:
+
+                    tmax = time.strptime('0:0:0', '%H:%M:%S')
+                    for d in list_dicts_post_holding:
+                        t = time.strptime(d['UpdateTime'], '%H:%M:%S')
+                        if tmax < t:
+                            longqty = d['LongQty']
+                            tmax = t
+                            post_holding_id = d['_id']
+                    print('The postholding has too many information', post_holding_id)
+
+                if len(list_dicts_holding) == 1:
+                    longqty_ref = list_dicts_holding[0]['LongQty']
+                    dict_holding_id = list_dicts_post_holding[0]['_id']
+                elif len(list_dicts_holding) == 0:
+                    pass
+                else:
+                    tmax = time.strptime('0:0:0', '%H:%M:%S')
+                    for d in list_dicts_holding:
+                        t = time.strptime(d['UpdateTime'], '%H:%M:%S')
+                        if tmax < t:
+                            longqty_ref = d['LongQty']
+                            dict_holding_id = d['_id']
+                            tmax = t
+
+                if len(list_dicts_secloan) == 1:
+                    shortqty = list_dicts_secloan[0]['ShortQty']
+                    dict_secloan_id = list_dicts_secloan[0]['_id']
+                elif len(list_dicts_secloan) == 0:
+                    pass
+                else:
+                    tmax = time.strptime('0:0:0', '%H:%M:%S')
+                    for d in list_dicts_holding:
+                        t = time.strptime(d['UpdateTime'], '%H:%M:%S')
+                        if tmax < t:
+                            shortqty = d['ShortQty']
+                            dict_secloan_id = d['_id']
+                            tmax = t
+                    print('The secloan has too many information', dict_secloan_id)
+
+                for dict_order in list_dicts_order:
+                    if self.str_day == dict_order['TradeDate']:
+                        side = dict_order['Side']
+                        cumqty = float(dict_order['CumQty'])  # todo 为啥是str?
+                        if side == 'buy':
+                            longqty += cumqty
+                        if side == 'sell':
+                            longqty -= cumqty
+                        if side == 'sell short':
+                            shortqty += cumqty
+                        if side == 'XQHQ':
+                            longqty -= cumqty
+                            shortqty -= cumqty
+                        if side == 'MQHQ':
+                            shortqty -= cumqty
                     else:
-                        print('The postdata has wrong information', post_holding, len(post_holding))
-
-                    post_secloan = list(self.db_posttrddata['fmtdata_secloan'].find(
-                        {'AcctIDByMXZ': acctidbymxz, 'DataDate': yesterday, 'SecurityID': secid,
-                         'SecurityIDSource': secidsrc}))
-                    if len(post_secloan) == 1:
-                        shortqty = post_secloan[0]['ShortQty']
-                    elif len(post_secloan) == 0:
-                        pass
-                    else:
-                        print('The postdata has wrong information', post_holding, len(post_secloan))
-
-                    list_dicts_order = list(self.db_trddata['fmtdata_order'].find(
-                        {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'SecurityID': secid,
-                         'SecurityIDSource': secidsrc, 'UpdateTime': {'$gte': self.record_fmt_time}}))
-                    # print('1986', len(list_dicts_order))
-                    for dict_order in list_dicts_order:
-                        if dict_order['TradeDate'] == self.str_day:
-                            side = dict_order['Side']
-                            cumqty = float(dict_order['CumQty'])  # todo 为啥是str?
-                            if side == 'buy':
-                                longqty += cumqty
-                            if side == 'sell':
-                                longqty -= cumqty
-                            if side == 'sell short':
-                                shortqty += cumqty
-                            if side == 'XQHQ':
-                                longqty -= cumqty
-                                shortqty -= cumqty
-                            if side == 'MQHQ':
-                                shortqty -= cumqty
-                        else:
-                            continue
+                        continue
 
                     if longqty < 0:  # 有的券商没有sell short说法
                         if shortqty == 0:
                             shortqty = - longqty
-                        else:
-                            raise Exception(f"LongQty is Negative: {shortqty}, {longqty}")
+                        elif abs(shortqty+longqty) < 0.01:  # 因为short仅仅来自postdata
+                            warnings.warn(f"LongQty is Negative: short: {shortqty}, long: {longqty}  because "
+                                          f"postdata is not clean, id {dict_secloan_id}")
                         longqty = 0
 
-                    # if abs(longqty - longqty_ref) > 0.01:
-                    #     print(dict_holding['_id'])
-                    #     raise Exception('The alogrithm to calculate longqty is somehow wrong!')
+                if abs(longqty - longqty_ref) > 0.01:
+                    warnings.warn(f"Please check fmtdata_holding:{dict_holding_id}, "
+                                  f"The alogrithm to calculate longqty is somehow wrong!")
 
+                # 只监控有票子的
+                if longqty != 0 or shortqty != 0:
+                    set_windcode_to_search = set_windcode_to_search|{windcode}
                     dict_position = {
                         'DataDate': self.str_day,
                         'UpdateTime': None,
@@ -2016,169 +2097,12 @@ class ExposMonit:
                     }
                     list_dicts_position.append(dict_position)
 
-                for dict_secloan in list_dicts_secloan:
-                    secid = dict_secloan['SecurityID']
-                    secidsrc = dict_secloan['SecurityIDSource']
-                    symbol = dict_secloan['Symbol']
-                    sectype = dict_secloan['SecurityType']
-                    windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
-                    windcode = secid + windcode_suffix
-                    list_windcode_used.append(windcode)
-                    if windcode in list_windcode_used:
-                        continue
-                    else:   # security without long position
-                        list_windcode_used.append(windcode)
-                        longqty_ref = 0  # if broker's holding is exact;
-                        longqty = 0
-                        shortqty = dict_secloan['ShortQty']
-                        post_holding = list(self.db_posttrddata['fmtdata_holding'].find(
-                            {'AcctIDByMXZ': acctidbymxz, 'DataDate': yesterday, 'SecurityID': secid,
-                             'SecurityIDSource': secidsrc}))
-                        if len(post_holding) == 1:
-                            longqty = post_holding[0]['LongQty']
-                        elif len(post_holding) == 0:
-                            pass
-                        else:
-                            print('The postdata has wrong information', post_holding, len(post_holding))
-                        list_dicts_order = list(self.db_trddata['fmtdata_order'].find(
-                            {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'SecurityID': secid,
-                             'SecurityIDSource': secidsrc, 'UpdateTime': {'$gte':  self.record_fmt_time}}))
-                        for dict_order in list_dicts_order:
-                            if dict_order['TradeDate'] == self.str_day:
-                                side = dict_order['Side']
-                                cumqty = float(dict_order['CumQty'])
-                                # 如果券商longqty准这些就要去掉
-                                if side == 'buy':
-                                    longqty += cumqty
-                                if side == 'sell':
-                                    longqty -= cumqty
-                                if side == 'sell short':
-                                    shortqty += cumqty
-                                if side == 'XQHQ':   # 会自相矛盾，因为既然long=0b不能现券还券
-                                    longqty -= cumqty
-                                    shortqty -= cumqty
-                                if side == 'MQHQ':
-                                    shortqty -= cumqty
-                            else:
-                                continue
-
-                        if longqty < 0:  # 有的券商没有sell short说法
-                            if shortqty == 0:
-                                shortqty = - longqty
-                            else:
-                                raise Exception(f"LongQty is Negative: {shortqty}, {longqty}")
-                            longqty = 0
-
-                        # if abs(longqty - longqty_ref) > 0.01:
-                        #     print(dict_secloan['_id'])
-                        #     raise Exception('The alogrithm to calculate longqty is somehow wrong!')
-
-                        dict_position = {
-                            'DataDate': self.str_day,
-                            'UpdateTime': None,
-                            'AcctIDByMXZ': acctidbymxz,
-                            'SecurityID': secid,
-                            'SecurityType': sectype,
-                            'Symbol': symbol,
-                            'SecurityIDSource': secidsrc,
-                            'LongQty': longqty,
-                            'ShortQty': shortqty,
-                            'LongAmt': None,
-                            'ShortAmt': None,
-                            'NetAmt': None,
-                            'WindCode': windcode
-                        }
-                        list_dicts_position.append(dict_position)
-
-                # holding 一个券最多一个，但order可以有多次
-                list_sec_ordered = list(self.db_trddata['fmtdata_order'].find({'AcctIDByMXZ': acctidbymxz,
-                                   'DataDate': self.str_day, 'UpdateTime': {'$gte': self.record_fmt_time}}))
-                for sec in list_sec_ordered:
-                    secid = sec['SecurityID']
-                    secidsrc = sec['SecurityIDSource']
-                    symbol = sec['Symbol']
-                    sectype = sec['SecurityType']
-                    windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
-                    windcode = secid + windcode_suffix
-                    list_windcode_used.append(windcode)
-                    if windcode in list_windcode_used:
-                        continue
-                    else:
-                        list_windcode_used.append(windcode)
-                        longqty_ref = 0  # if broker's holding is exact;
-                        longqty = 0
-                        shortqty = 0  # yesterday secloan has no data
-                        # 可能今日平仓
-                        post_holding = list(self.db_posttrddata['fmtdata_holding'].find(
-                            {'AcctIDByMXZ': acctidbymxz, 'DataDate': yesterday, 'SecurityID': secid,
-                             'SecurityIDSource': secidsrc}))
-                        if len(post_holding) == 1:
-                            longqty = post_holding[0]['LongQty']
-                        elif len(post_holding) == 0:
-                            pass
-                        else:
-                            print('The postdata has wrong information', post_holding, len(post_holding))
-                        list_dicts_order = list(self.db_trddata['fmtdata_order'].find(
-                            {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'SecurityID': secid,
-                             'SecurityIDSource': secidsrc, 'UpdateTime': {'$gte': self.record_fmt_time}}))
-                        for dict_order in list_dicts_order:
-                            if dict_order['TradeDate'] == self.str_day:
-                                side = dict_order['Side']
-                                cumqty = float(dict_order['CumQty'])
-                                # 如果券商longqty准这些就要去掉
-                                if side == 'buy':
-                                    longqty += cumqty
-                                if side == 'sell':
-                                    longqty -= cumqty
-                                if side == 'sell short':
-                                    shortqty += cumqty
-                                if side == 'XQHQ':   # 会自相矛盾，因为既然long=0b不能现券还券
-                                    raise ValueError('Contradictory Phenomenon')
-                                if side == 'MQHQ':
-                                    shortqty -= cumqty
-                            else:
-                                continue
-
-                        if longqty < 0:  # 有的券商没有sell short说法
-                            if shortqty == 0:
-                                shortqty = - longqty
-                            else:
-                                raise Exception(f"LongQty is Negative: {shortqty}, {longqty}")
-                            longqty = 0
-
-                        # if abs(longqty - longqty_ref) > 0.01:
-                        #     print(sec['_id'])
-                        #     raise Exception('The alogrithm to calculate longqty is somehow wrong!')
-
-                        dict_position = {
-                            'DataDate': self.str_day,
-                            'UpdateTime': None,
-                            'AcctIDByMXZ': acctidbymxz,
-                            'SecurityID': secid,
-                            'SecurityType': sectype,
-                            'Symbol': symbol,
-                            'SecurityIDSource': secidsrc,
-                            'LongQty': longqty,
-                            'ShortQty': shortqty,
-                            'LongAmt': None,
-                            'ShortAmt': None,
-                            'NetAmt': None,
-                            'WindCode': windcode
-                        }
-                        list_dicts_position.append(dict_position)
-                    # 按acctidbymxz exposure数据
             elif accttype in ['f'] and (not self.clearing):
-                list_dicts_holding_future = list(self.db_trddata['future_api_holding'].find(
-                        {'DataDate': self.str_day, 'AcctIDByMXZ': acctidbymxz})) # , 'UpdateTime': self.record_update_raw_time
                 # list_dicts_holding_future_exposure_draft = []
                 for dict_holding_future in list_dicts_holding_future:
-                    secid = dict_holding_future['instrument_id']
                     secid_first_part = secid[:-4]
-                    secidsrc = dict_holding_future['exchange']
                     dict_future2spot_windcode = {'IC': '000905.SH', 'IH': '000016.SH', 'IF': '000300.SH'}
                     windcode = dict_future2spot_windcode[secid_first_part]
-                    list_windcode_used.append(windcode)
-
                     qty = dict_holding_future['position']
                     direction = dict_holding_future['direction']
                     future_longqty = 0
@@ -2193,28 +2117,29 @@ class ExposMonit:
                     else:
                         raise ValueError('Unknown direction in future respond.')
 
-                    dict_position = {
-                        'DataDate': self.str_day,
-                        'UpdateTime': None,
-                        'AcctIDByMXZ': acctidbymxz,
-                        'SecurityID': secid,
-                        'SecurityType': 'Index Future',  # todo 用函数获取类型
-                        'Symbol': None,
-                        'SecurityIDSource': secidsrc,
-                        'LongQty': future_longqty,
-                        'ShortQty': future_shortqty,
-                        'LongAmt': None,
-                        'ShortAmt': None,
-                        'NetAmt': None,
-                        'WindCode': windcode
-                    }
-                    list_dicts_position.append(dict_position)
+                    if future_longqty != 0 or future_shortqty != 0:
+                        set_windcode_to_search = set_windcode_to_search | {windcode}
+                        dict_position = {
+                            'DataDate': self.str_day,
+                            'UpdateTime': None,
+                            'AcctIDByMXZ': acctidbymxz,
+                            'SecurityID': secid,
+                            'SecurityType': 'Index Future',  # todo 用函数获取类型
+                            'Symbol': None,
+                            'SecurityIDSource': secidsrc,
+                            'LongQty': future_longqty,
+                            'ShortQty': future_shortqty,
+                            'LongAmt': None,
+                            'ShortAmt': None,
+                            'NetAmt': None,
+                            'WindCode': windcode
+                        }
+                        list_dicts_position.append(dict_position)
 
         # 统一一次询问现价，节约时间，市价更加精确
         self.record_position_query_time = datetime.datetime.today().strftime("%H:%M:%S")
         # self.record_wind_query_time = (datetime.datetime.today() - datetime.timedelta(hours=1, seconds=10)).strftime("%H:%M:%S")
-        # print('2233', len(list_windcode_used))
-        dict_windcode2last = self.get_order_last_from_wind(list_windcode_used)
+        dict_windcode2last = self.get_order_last_from_wind(list(set_windcode_to_search))
         # print('2230 get last finished')
         # print(dict_windcode2last)
         for dict_position in list_dicts_position:
@@ -2237,17 +2162,17 @@ class ExposMonit:
             self.db_trddata['position'].delete_many({'DataDate': self.str_day, 'UpdateTime': self.record_position_query_time})
             self.db_trddata['position'].insert_many(list_dicts_position)
         self.record_fmt_time = None     # 让他下一个循环也等待fmt跑1秒
-        # print("Update Position finished")
+        print("Update Position finished")
         return
 
     @run_every_30s
     def exposure_analysis(self):
-
-        list_dicts_acctidbymxz = self.col_acctinfo.find({'DataDate': self.str_day, 'RptMark': 1},
-                                                       {'_id': 0, 'AcctIDByMXZ': 1})
-        list_acctidbymxz = []
+        # todo 按照产品汇总， 策略字段留出来
+        list_dicts_acctidbymxz = self.db_trddata['position'].find({'DataDate': self.str_day, 'UpdateTime':{'$gte': self.record_position_query_time}})
+        set_acctidbymxz = set()
         for _ in list_dicts_acctidbymxz:
-            list_acctidbymxz.append(_['AcctIDByMXZ'])
+            set_acctidbymxz = set_acctidbymxz|{_['AcctIDByMXZ']}
+        list_acctidbymxz = list(set_acctidbymxz)
         dict_index = {'LongQty': 1, 'ShortQty': 1, 'LongAmt': 1, 'ShortAmt': 1, 'NetAmt': 1}
         exposure_df = pd.DataFrame(columns=list_acctidbymxz, index=dict_index)
         exposure_df = exposure_df.fillna(0)
@@ -2257,20 +2182,21 @@ class ExposMonit:
             {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'UpdateTime': {'$gte': self.record_position_query_time}}, dict_index))
             # 加上 updatetime
             for position in list_dicts_position:
-                exposure_df[acctidbymxz] += list(position.values())  #
+                exposure_df[acctidbymxz] += list(position.values())
+                # dataFrame 更改会每行遍历非常慢！
                 # print(exposure_df.loc[acctidbymxz, :])
 
         exposure_docs = []
+        print(exposure_df)
         for index, row in exposure_df.T.iterrows():
             doc = dict(row)
             doc.update({'AcctIDByMXZ': index, 'DataDate': self.str_day, 'UpdateTime': self.record_position_query_time})
             exposure_docs.append(doc)
         if exposure_docs:
-            print(exposure_docs)
             self.db_trddata['exposure'].delete_many({'DataDate': self.str_day, 'UpdateTime': self.record_position_query_time})
             self.db_trddata['exposure'].insert_many(exposure_docs)
         self.record_position_query_time = None
-        # print("Exposure Analysis Finished")
+        print("Exposure Analysis Finished")
         return exposure_df   # 可视化... + 时间：self.record_position_query_time
 
     def run(self):
@@ -2288,8 +2214,8 @@ class ExposMonit:
             # 分先后顺序
             # todo 有时候post会在其他前先触发，mongoDB可以写入，但是读出数据是“老版”数据，如何不影响多线程调？
             # update_updateraw_thread.start()
-            update_future_thread.start()
-            self.record_update_raw_time = '14:00:00'
+            # update_future_thread.start()
+            self.record_update_raw_time = '16:00:00'
             # self.record_position_query_time = '11:12:34'
             update_fmtted_thread.start()
             # wait....some seconds?
@@ -2326,7 +2252,3 @@ if __name__ == '__main__':
     #     test.db_trddata.drop_collection(col)
 
     test.run()
-    # test.upload_basic_info()
-    # print('basic info uploaded!')
-    # test.update_rawdata()
-    # test.update_trddata_f()
