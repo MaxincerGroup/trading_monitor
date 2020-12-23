@@ -5,3 +5,5 @@
 workgroup\administrator
 Ms123456
 
+注意，此处basic info本地版，有些信息独立且必须，不能乱改!
+

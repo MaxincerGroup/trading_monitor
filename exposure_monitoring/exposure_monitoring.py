@@ -1,11 +1,7 @@
 """
-todo list
-1. basic_info 上传到数据库里
-2. 利用db_trading_data 里的已有函数生成raw, 更新？- 边用边改
-3. 万得学习wss, 实盘数据，时间序列：获取close以及实时交易数据
-   获取close， 行情数据所有股票的last （wst获得，30s一次），先放到raw（一个thread）
-   再从raw里，根据每个持仓的股票信息（用代码）搜索
-4. post-trade-data每天早上9:00获取清算数据？量大？
+todo list 12.15
+2. cash里字段在position处理时生成
+3. position: order + loan + last算出short，结合holding合成
 """
 import pandas as pd
 import pymongo
@@ -26,14 +22,31 @@ def run_every_30s(func):
     @functools.wraps(func)
     # 人的操作成本比较高，生产环节得删..
     def wrapper(self, *args, **kwargs):
-        while self.running:
-            if self.event.is_set():
-                self.lock.acquire()
-                func(self, *args, **kwargs)
-                self.lock.release()
-                print('Function: ', func.__name__, 'finished')
-                time.sleep(10)
-                # print('I am awaken!')
+        if self.clearing:   # 清算只跑一次; 只跑一次测试
+            func(self, *args, **kwargs)
+        else:
+            while self.running:
+                if self.event.is_set():
+                    # todo 这样处理和单线程没区别了...
+                    if func.__name__ == 'update_fmtdata':
+                        while self.record_update_raw_time is None:  # 等待updateraw开始1s
+                            time.sleep(1)
+                    if func.__name__ == 'update_position':
+                        while self.record_fmt_time is None:  # 等待fmt开始1s
+                            time.sleep(1)
+                    if func.__name__ == 'exposure_monitoring':
+                        while self.record_position_query_time is None:  # 等待position开始1s
+                            time.sleep(1)
+                    self.lock.acquire()  # 只有上面三个变量可以大家都调用, 其余公共变量锁住
+                    func(self, *args, **kwargs)
+                    self.lock.release()
+                    print('Function: ', func.__name__, 'finished')
+                    time.sleep(30)
+                    if func.__name__ == 'update_fmtdata':
+                        self.record_update_raw_time = '14:00:00'
+                        print('start again')
+                    # print('I am awaken!')
+
     return wrapper
 
 
@@ -46,18 +59,27 @@ class ExposMonit:
         3.database names and collection names : trddata, basicinfo
         4.date
         """
-        # w.start()
-        # todo 时间最好有今天以及昨天两个，因为各个文档更新时间不同(如果今天找不到，找数据库/地址里前一天的）
-        self.dt_day = datetime.datetime.today() - datetime.timedelta(days=1)
+        w.start()
+
+        self.dt_day = datetime.datetime(2020, 12, 18, 10, 0, 0)    # datetime.datetime.today() - datetime.timedelta(days=3)
         self.str_day = self.dt_day.strftime('%Y%m%d')
+        end_clearing = datetime.datetime.strptime(f"{self.str_day} 08:30:00", "%Y%m%d %H:%M:%S")  # 今早清算结束
+        start_clearing = datetime.datetime.strptime(f"{self.str_day} 21:30:00", "%Y%m%d %H:%M:%S")  # 今晚清算开始
+        self.clearing = not (start_clearing > self.dt_day > end_clearing)
 
         self.client_mongo = pymongo.MongoClient(port=27017, host='localhost',
                                                 username='admin', password='123456')
+
+        self.db_posttrddata = self.client_mongo['posttrddata']
         self.db_trddata = self.client_mongo['trddata']
         self.db_basicinfo = self.client_mongo['basicinfo']
         self.col_acctinfo = self.db_basicinfo['acctinfo']
 
-        # self.dict_wcode2close = self.update_close_from_wind()
+        # self.dict_wcode2close = self.update_close_from_wind()   # 仅期货里用
+        self.record_wind_query_time = None   # 9:30第一次找万得数据
+        self.record_position_query_time = None
+        self.record_fmt_time = None
+        self.record_update_raw_time = None
 
         self.path_basic_info = 'data/basic_info.xlsx'
         self.dict_future2multiplier = {'IC': 200, 'IH': 300, 'IF': 300}
@@ -81,34 +103,34 @@ class ExposMonit:
             self.db_basicinfo[sheet_name].insert_many(list_records)
         return
 
-    def read_rawdata_from_trdclient(self, fpath, str_c_h_secliability_mark, data_source_type, accttype,
+    def read_rawdata_from_trdclient(self, fpath, str_c_h_secloan_mark, data_source_type, accttype,
                                     acctidbybroker):
         """
         从客户端下载数据，并进行初步清洗。为字符串格式。
         tdx倒出的txt文件有“五粮液错误”，使用xls格式的可解决
 
         已更新券商处理格式：
-            华泰: hexin, txt, cash, margin, capital, holding
+            华泰: hexin, txt, cash, margin, fund, holding
             国君: 富易, csv
-            海通: ehtc, xlsx, cash, capital, holding
+            海通: ehtc, xlsx, cash, fund, holding
             申宏: alphabee, txt
             建投: alphabee, txt
-            中信: tdx, txt, vip, cash, capital, holding,
+            中信: tdx, txt, vip, cash, fund, holding,
             民生: tdx, txt
             华福: tdx, txt
 
         :param acctidbybroker: 用于pb类文件对账户编号的过滤。
         :param fpath:
         :param accttype: c: cash, m: margin, f: future
-        :param str_c_h_secliability_mark: ['capital', 'holding', 'secliability']
+        :param str_c_h_secloan_mark: ['fund', 'holding', 'secloan']
         :param data_source_type:
 
         :return: list: 由dict rec组成的list
         """
         # todo : 注释改进
         list_ret = []
-        if str_c_h_secliability_mark == 'capital':
-            dict_rec_capital = {}
+        if str_c_h_secloan_mark == 'fund':
+            dict_rec_fund = {}
             if data_source_type in ['huat_hx', 'hait_hx', 'zhes_hx', 'tf_hx', 'db_hx', 'wk_hx'] and accttype == 'c':
                 with open(fpath, 'rb') as f:
                     list_datalines = f.readlines()[0:6]
@@ -116,18 +138,18 @@ class ExposMonit:
                         list_data = dataline.strip().split(b'\t')
                         for data in list_data:
                             list_recdata = data.strip().decode('gbk').split('：')
-                            dict_rec_capital[list_recdata[0].strip()] = list_recdata[1].strip()
+                            dict_rec_fund[list_recdata[0].strip()] = list_recdata[1].strip()
 
             elif data_source_type in ['yh_hx'] and accttype in ['c']:
                 with open(fpath, 'rb') as f:
                     list_datalines = f.readlines()
                     list_keys = list_datalines[5].decode('gbk').split()
                     list_values = list_datalines[6].decode('gbk').split()
-                    dict_rec_capital.update(dict(zip(list_keys, list_values)))
+                    dict_rec_fund.update(dict(zip(list_keys, list_values)))
 
             elif data_source_type in ['yh_datagrp']:
                 df_read = pd.read_excel(fpath, nrows=2)
-                dict_rec_capital = df_read.to_dict('records')[0]
+                dict_rec_fund = df_read.to_dict('records')[0]
 
             elif data_source_type in ['huat_hx', 'hait_hx', 'wk_hx'] and accttype == 'm':
                 with open(fpath, 'rb') as f:
@@ -141,7 +163,7 @@ class ExposMonit:
                             list_recdata = data.strip().decode('gbk').split(':')
                             if len(list_recdata) != 2:
                                 list_recdata = data.strip().decode('gbk').split('：')
-                            dict_rec_capital[list_recdata[0].strip()] = \
+                            dict_rec_fund[list_recdata[0].strip()] = \
                                 (lambda x: x if x.strip() in ['人民币'] else list_recdata[1].strip())(list_recdata[1])
 
             elif data_source_type in ['gtja_fy'] and accttype in ['c', 'm']:
@@ -149,15 +171,15 @@ class ExposMonit:
                 ws = wb.sheet_by_index(0)
                 list_keys = ws.row_values(5)
                 list_values = ws.row_values(6)
-                dict_rec_capital.update(dict(zip(list_keys, list_values)))
+                dict_rec_fund.update(dict(zip(list_keys, list_values)))
 
             elif data_source_type in ['hait_ehtc'] and accttype == 'c':
                 df_read = pd.read_excel(fpath, skiprows=1, nrows=1)
-                dict_rec_capital = df_read.to_dict('records')[0]
+                dict_rec_fund = df_read.to_dict('records')[0]
 
             elif data_source_type in ['hait_datagrp']:
                 df_read = pd.read_excel(fpath, nrows=2)
-                dict_rec_capital = df_read.to_dict('records')[0]
+                dict_rec_fund = df_read.to_dict('records')[0]
 
             elif data_source_type in ['xc_tdx', 'zx_tdx', 'ms_tdx'] and accttype in ['c', 'm']:
                 # todo 存在五 粮 液错误
@@ -167,7 +189,7 @@ class ExposMonit:
                     list_recdata = dataline.strip().decode('gbk').split()
                     for recdata in list_recdata:
                         list_recdata = recdata.split(':')
-                        dict_rec_capital.update({list_recdata[0]: list_recdata[1]})
+                        dict_rec_fund.update({list_recdata[0]: list_recdata[1]})
 
             elif data_source_type in ['wk_tdx', 'zhaos_tdx', 'huat_tdx', 'hf_tdx', 'gx_tdx'] and accttype in ['c',
                                                                                                               'm']:
@@ -178,7 +200,7 @@ class ExposMonit:
                         '\t')
                     list_values = list_datalines[1].strip().decode('gbk').replace('=', '').replace('"', '').split(
                         '\t')
-                    dict_rec_capital.update(dict(zip(list_keys, list_values)))
+                    dict_rec_fund.update(dict(zip(list_keys, list_values)))
 
             elif data_source_type in ['zxjt_alphabee', 'swhy_alphabee'] and accttype in ['c', 'm']:
                 fpath = fpath.replace('<YYYYMMDD>', self.str_day)
@@ -186,31 +208,33 @@ class ExposMonit:
                     list_datalines = f.readlines()
                     list_keys = list_datalines[0].decode('gbk').split()
                     list_values = list_datalines[1].decode('gbk').split()
-                    dict_rec_capital.update(dict(zip(list_keys, list_values)))
+                    dict_rec_fund.update(dict(zip(list_keys, list_values)))
 
             elif data_source_type in ['swhy_alphabee_dbf2csv', 'ax_custom']:
                 with open(fpath, 'rb') as f:
                     list_datalines = f.readlines()
                     list_keys = list_datalines[0].decode('gbk').split(',')
                     list_values = list_datalines[1].decode('gbk').split(',')
-                    dict_rec_capital.update(dict(zip(list_keys, list_values)))
+                    dict_rec_fund.update(dict(zip(list_keys, list_values)))
 
             elif data_source_type in ['patch']:
                 pass
 
             elif data_source_type in ['zx_wealthcats']:
                 fpath = fpath.replace('YYYY-MM-DD', self.dt_day.strftime('%Y-%m-%d'))
+                # print(fpath)
                 with codecs.open(fpath, 'rb', 'utf-8-sig') as f:
                     list_datalines = f.readlines()
                     list_keys = list_datalines[0].strip().split(',')
                     for dataline in list_datalines[1:]:
                         list_values = dataline.strip().split(',')
                         if len(list_values) == len(list_keys):
-                            dict_capital_wealthcats = dict(zip(list_keys, list_values))
-                            if dict_capital_wealthcats['账户'] == acctidbybroker:
-                                dict_rec_capital.update(dict_capital_wealthcats)
+                            dict_fund_wealthcats = dict(zip(list_keys, list_values))
+                            if dict_fund_wealthcats['账户'] == acctidbybroker:
+                                dict_rec_fund.update(dict_fund_wealthcats)
 
             elif data_source_type in ['db_wealthcats']:
+                # todo weathcats账户和basic_info里对不上
                 fpath = fpath.replace('YYYY-MM-DD', self.dt_day.strftime('%Y-%m-%d'))
                 with codecs.open(fpath, 'rb', 'utf-8-sig') as f:
                     list_datalines = f.readlines()
@@ -218,9 +242,9 @@ class ExposMonit:
                     for dataline in list_datalines[1:]:
                         list_values = dataline.strip().split(',')
                         if len(list_values) == len(list_keys):
-                            dict_capital_wealthcats = dict(zip(list_keys, list_values))
-                            if dict_capital_wealthcats['账户'] == acctidbybroker:
-                                dict_rec_capital.update(dict_capital_wealthcats)
+                            dict_fund_wealthcats = dict(zip(list_keys, list_values))
+                            if dict_fund_wealthcats['账户'] == acctidbybroker:
+                                dict_rec_fund.update(dict_fund_wealthcats)
 
             elif data_source_type in ['ax_jzpb']:
                 # todo 账户编号不稳定，求源
@@ -231,11 +255,11 @@ class ExposMonit:
                     for dataline in list_datalines[1:]:
                         list_values = dataline.strip().split(',')
                         if len(list_values) == len(list_keys):
-                            dict_capital_wealthcats = dict(zip(list_keys, list_values))
-                            if dict_capital_wealthcats['账户编号'] == acctidbybroker:
-                                dict_rec_capital.update(dict_capital_wealthcats)
+                            dict_fund_wealthcats = dict(zip(list_keys, list_values))
+                            if dict_fund_wealthcats['账户编号'] == acctidbybroker:
+                                dict_rec_fund.update(dict_fund_wealthcats)
 
-            elif data_source_type in ['zxjt_xtpb', 'zhaos_xtpb', 'zhes_xtpb', 'hf_xtpb']:   # 有改动
+            elif data_source_type in ['zxjt_xtpb', 'zhaos_xtpb', 'zhes_xtpb', 'hf_xtpb', 'hait_xtpb']:   # 有改动
                 # todo 更改路径中的日期？没看到日期YYYYMMDD,校验新加的
                 fpath = fpath.replace('YYYYMMDD', self.str_day)
                 with codecs.open(fpath, 'rb', 'gbk') as f:
@@ -244,11 +268,10 @@ class ExposMonit:
                     for dataline in list_datalines[1:]:
                         list_values = dataline.strip().split(',')
                         if len(list_values) == len(list_keys):
-                            dict_capital = dict(zip(list_keys, list_values))
-                            if dict_capital['资金账号'] == acctidbybroker:
-                                dict_rec_capital.update(dict_capital)
+                            dict_fund = dict(zip(list_keys, list_values))
+                            if dict_fund['资金账号'] == acctidbybroker:
+                                dict_rec_fund.update(dict_fund)
             elif data_source_type in ['huat_matic_tsi']:    # 有改动
-                # todo : raw变format所需要的名称
                 fpath = fpath.replace('<YYYYMMDD>', self.str_day)
                 with codecs.open(fpath, 'rb', 'utf-8-sig') as f:
                     list_datalines = f.readlines()
@@ -256,11 +279,10 @@ class ExposMonit:
                     for dataline in list_datalines[1:]:
                         list_values = dataline.strip().split(',')
                         if len(list_values) == len(list_keys):
-                            dict_capital = dict(zip(list_keys, list_values))
-                            if dict_capital['fund_account'] == acctidbybroker:
-                                dict_rec_capital.update(dict_capital)    # 有改动
+                            dict_fund = dict(zip(list_keys, list_values))
+                            if dict_fund['fund_account'] == acctidbybroker:
+                                dict_rec_fund.update(dict_fund)    # 有改动
             elif data_source_type in ['gs_htpb']:    # 有改动
-                # todo : raw变format所需要的名称
                 fpath = fpath.replace('YYYYMMDD', self.str_day)
                 with codecs.open(fpath, 'rb', 'gbk') as f:
                     list_datalines = f.readlines()
@@ -269,11 +291,10 @@ class ExposMonit:
                     for dataline in list_datalines[1:]:
                         list_values = dataline.strip().split(',')
                         if len(list_values) == len(list_keys):
-                            dict_capital = dict(zip(list_keys, list_values))
-                            if dict_capital['资金账户'] == acctidbybroker:
-                                dict_rec_capital.update(dict_capital)
+                            dict_fund = dict(zip(list_keys, list_values))
+                            if dict_fund['资金账户'] == acctidbybroker:
+                                dict_rec_fund.update(dict_fund)
             elif data_source_type in ['gtja_pluto']:     # 有改动
-                # todo : raw变format所需要的名称
                 fpath = fpath.replace('YYYYMMDD', self.str_day)
                 with codecs.open(fpath, 'rb', 'gbk') as f:
                     list_datalines = f.readlines()
@@ -282,14 +303,16 @@ class ExposMonit:
                     for dataline in list_datalines[1:]:
                         list_values = dataline.strip().split(',')
                         if len(list_values) == len(list_keys):
-                            dict_capital = dict(zip(list_keys, list_values))
-                            if dict_capital['单元序号'] == acctidbybroker:
-                                dict_rec_capital.update(dict_capital)
+                            dict_fund = dict(zip(list_keys, list_values))
+                            if dict_fund['单元序号'] == acctidbybroker:
+                                dict_rec_fund.update(dict_fund)
             else:
+                print(data_source_type)
                 raise ValueError('Field data_source_type not exist in basic info!')
-            list_ret.append(dict_rec_capital)
+            if dict_rec_fund:  # we do not upload {}, todo 新加的
+                list_ret.append(dict_rec_fund)
 
-        elif str_c_h_secliability_mark == 'holding':
+        elif str_c_h_secloan_mark == 'holding':
             if data_source_type in ['xc_tdx', 'zx_tdx', 'ms_tdx'] and accttype in ['c', 'm']:
                 # todo 存在五粮液错误
                 with open(fpath, 'rb') as f:
@@ -454,7 +477,7 @@ class ExposMonit:
                             if dict_rec_holding['账户编号'] == acctidbybroker:
                                 list_ret.append(dict_rec_holding)
 
-            elif data_source_type in ['zxjt_xtpb','zhaos_xtpb', 'zhes_xtpb', 'hf_xtpb']:   # 有改动
+            elif data_source_type in ['zxjt_xtpb','zhaos_xtpb', 'zhes_xtpb', 'hf_xtpb', 'hait_xtpb']:   # 有改动
                 # todo 更改文件中的路径
                 fpath = fpath.replace('YYYYMMDD', self.str_day)
                 with codecs.open(fpath, 'rb', 'gbk') as f:
@@ -468,7 +491,6 @@ class ExposMonit:
                                 list_ret.append(dict_rec_holding)
 
             elif data_source_type in ['huat_matic_tsi']:    # 有改动
-                # todo : raw变format所需要的名称
                 fpath = fpath.replace('<YYYYMMDD>', self.str_day)
                 with codecs.open(fpath, 'rb', 'gbk') as f:
                     list_datalines = f.readlines()
@@ -480,7 +502,6 @@ class ExposMonit:
                             if dict_rec_holding['fund_account'] == acctidbybroker:
                                 list_ret.append(dict_rec_holding)
             elif data_source_type in ['gs_htpb']:    # 有改动
-                # todo : raw变format所需要的名称
                 fpath = fpath.replace('YYYYMMDD', self.str_day)
                 with codecs.open(fpath, 'rb', 'gbk') as f:
                     list_datalines = f.readlines()
@@ -492,7 +513,6 @@ class ExposMonit:
                             if dict_rec_holding['资金账户'] == acctidbybroker:
                                 list_ret.append(dict_rec_holding)
             elif data_source_type in ['gtja_pluto']:     # 有改动
-                # todo : raw变format所需要的名称
                 fpath = fpath.replace('YYYYMMDD', self.str_day)
                 with codecs.open(fpath, 'rb', 'gbk') as f:
                     list_datalines = f.readlines()
@@ -504,32 +524,31 @@ class ExposMonit:
                             if dict_rec_holding['单元序号'] == acctidbybroker:
                                 list_ret.append(dict_rec_holding)
 
-        elif str_c_h_secliability_mark == 'secliability':
-            # todo 加上其它的有secloan的券商
-            print('Here it is')
+        elif str_c_h_secloan_mark == 'secloan':
+            # postdata处理raw用，交易时不读
             if data_source_type in ['zhaos_tdx'] and accttype in ['m']:
                 with open(fpath, 'rb') as f:
                     list_datalines = f.readlines()
-                    start_index_secliability = None
+                    start_index_secloan = None
                     for index, dataline in enumerate(list_datalines):
                         str_dataline = dataline.decode('gbk')
                         if '证券代码' in str_dataline:
-                            start_index_secliability = index
-                    list_keys = [x.decode('gbk') for x in list_datalines[start_index_secliability].strip().split()]
+                            start_index_secloan = index
+                    list_keys = [x.decode('gbk') for x in list_datalines[start_index_secloan].strip().split()]
                     i_list_keys_length = len(list_keys)
-                    for dataline in list_datalines[start_index_secliability + 1:]:
+                    for dataline in list_datalines[start_index_secloan + 1:]:
                         list_data = dataline.strip().split()
                         if len(list_data) == i_list_keys_length:
                             list_values = [x.decode('gbk') for x in list_data]
-                            dict_rec_holding = dict(zip(list_keys, list_values))
+                            dict_rec_secloan = dict(zip(list_keys, list_values))
                             # todo 自定义： 根据证券代码推测交易市场
-                            secid = dict_rec_holding['证券代码']
+                            secid = dict_rec_secloan['证券代码']
                             if secid[0] in ['0', '1', '3']:
-                                dict_rec_holding['交易市场'] = '深A'
+                                dict_rec_secloan['交易市场'] = '深A'
                             else:
-                                dict_rec_holding['交易市场'] = '沪A'
-                            list_ret.append(dict_rec_holding)
-            elif data_source_type in ['zxjt_xtpb', 'zhaos_xtpb', 'zhes_xtpb', 'hf_xtpb'] and accttype in ['m']:
+                                dict_rec_secloan['交易市场'] = '沪A'
+                            list_ret.append(dict_rec_secloan)
+            elif data_source_type in ['zxjt_xtpb', 'zhaos_xtpb', 'zhes_xtpb', 'hf_xtpb', 'hait_xtpb'] and accttype in ['m']:
                 fpath = fpath.replace('YYYYMMDD', self.str_day)
                 with codecs.open(fpath, 'rb', 'gbk') as f:
                     list_datalines = f.readlines()
@@ -537,9 +556,9 @@ class ExposMonit:
                     for dataline in list_datalines[1:]:
                         list_values = dataline.strip().split(',')
                         if len(list_values) == len(list_keys):
-                            dict_rec_holding = dict(zip(list_keys, list_values))
-                            if dict_rec_holding['资金账号'] == acctidbybroker:
-                                list_ret.append(dict_rec_holding)
+                            dict_rec_secloan = dict(zip(list_keys, list_values))
+                            if dict_rec_secloan['资金账号'] == acctidbybroker:
+                                list_ret.append(dict_rec_secloan)
             elif data_source_type in ['huat_matic_tsi'] and accttype in ['m']:  # 有改动
                 fpath = fpath.replace('<YYYYMMDD>', self.str_day)
                 with codecs.open(fpath, 'rb', 'gbk') as f:
@@ -548,9 +567,9 @@ class ExposMonit:
                     for dataline in list_datalines[1:]:
                         list_values = dataline.strip().split(',')
                         if len(list_values) == len(list_keys):
-                            dict_rec_holding = dict(zip(list_keys, list_values))
-                            if dict_rec_holding['fund_account'] == acctidbybroker:
-                                list_ret.append(dict_rec_holding)
+                            dict_rec_secloan = dict(zip(list_keys, list_values))
+                            if dict_rec_secloan['fund_account'] == acctidbybroker:
+                                list_ret.append(dict_rec_secloan)
             elif data_source_type in ['gtja_pluto'] and accttype in ['m']:     # 有改动
                 fpath = fpath.replace('YYYYMMDD', self.str_day)
                 with codecs.open(fpath, 'rb', 'gbk') as f:
@@ -559,26 +578,72 @@ class ExposMonit:
                     for dataline in list_datalines[1:]:
                         list_values = dataline.strip().split(',')
                         if len(list_values) == len(list_keys):
-                            dict_rec_holding = dict(zip(list_keys, list_values))
-                            if dict_rec_holding['单元序号'] == acctidbybroker:
-                                list_ret.append(dict_rec_holding)
-
+                            dict_rec_secloan = dict(zip(list_keys, list_values))
+                            if dict_rec_secloan['单元序号'] == acctidbybroker:
+                                list_ret.append(dict_rec_secloan)
+        elif str_c_h_secloan_mark == 'order':
+            # 先做这几个有secloan的（不然order没意义）:
+            if data_source_type in ['zxjt_xtpb', 'zhaos_xtpb', 'zhes_xtpb', 'hf_xtpb', 'hait_xtpb']:
+                fpath = fpath.replace('YYYYMMDD', self.str_day)
+                with codecs.open(fpath, 'rb', 'gbk') as f:
+                    list_datalines = f.readlines()
+                    list_keys = list_datalines[0].strip().split(',')
+                    for dataline in list_datalines[1:]:
+                        list_values = dataline.strip().split(',')
+                        if len(list_values) == len(list_keys):
+                            dict_rec_order = dict(zip(list_keys, list_values))
+                            if dict_rec_order['资金账号'] == acctidbybroker:
+                                list_ret.append(dict_rec_order)
+            elif data_source_type in ['huat_matic_tsi'] and accttype:  # 有改动
+                fpath = fpath.replace('<YYYYMMDD>', self.str_day)
+                with codecs.open(fpath, 'rb', 'gbk') as f:
+                    list_datalines = f.readlines()
+                    list_keys = list_datalines[0].strip().split(',')
+                    for dataline in list_datalines[1:]:
+                        list_values = dataline.strip().split(',')
+                        if len(list_values) == len(list_keys):
+                            dict_rec_order = dict(zip(list_keys, list_values))
+                            if dict_rec_order['fund_account'] == acctidbybroker:
+                                list_ret.append(dict_rec_order)
+            elif data_source_type in ['gtja_pluto'] and accttype:     # 有改动
+                fpath = fpath.replace('YYYYMMDD', self.str_day)
+                with codecs.open(fpath, 'rb', 'gbk') as f:
+                    list_datalines = f.readlines()
+                    list_keys = list_datalines[0].strip().split(',')
+                    for dataline in list_datalines[1:]:
+                        list_values = dataline.strip().split(',')
+                        if len(list_values) == len(list_keys):
+                            dict_rec_order = dict(zip(list_keys, list_values))
+                            if dict_rec_order['单元序号'] == acctidbybroker:
+                                list_ret.append(dict_rec_order)
         else:
-            raise ValueError('Wrong str_c_h_secliability_mark input!')
+            raise ValueError('Wrong str_c_h_secloan_mark input!')
         return list_ret
 
+    # update_all_rawdata太慢了！
     @run_every_30s
-    def update_rawdata(self):
+    def update_all_rawdata(self):
         """
         1. 出于数据处理留痕及增强robust考虑，将原始数据按照原格式上传到mongoDB中备份
-        2. 定义DataFilePath = ['fpath_capital_data'(source), 'fpath_holding_data'(source), 'fpath_trdrec_data(source)',]
+        2. 定义DataFilePath = ['fpath_fund_data'(source), 'fpath_holding_data'(source), 'fpath_trdrec_data(source)',]
         3. acctinfo数据库中DataFilePath存在文件路径即触发文件数据的上传。
         4. 添加：融券未平仓合约数据的上传
         """
-        col_manually_rawdata_capital = self.db_trddata['manually_rawdata_capital']
-        col_manually_rawdata_holding = self.db_trddata['manually_rawdata_holding']
-        col_manually_rawdata_secliability = self.db_trddata['manually_rawdata_secliability']
-        for _ in self.col_acctinfo.find({'DataDate': self.str_day, 'RptMark': 1}, {'_id': 0}):
+        self.record_update_raw_time = datetime.datetime.today().strftime('%H:%M:%S')
+        # UpdateTime 不用过于精确，只是方便format时查找（只更新最新版）
+        if self.clearing:  # update post-trade
+            col_manually_rawdata_fund = self.db_posttrddata['manually_rawdata_fund']
+            col_manually_rawdata_holding = self.db_posttrddata['manually_rawdata_holding']
+            col_manually_rawdata_order = self.db_posttrddata['manually_rawdata_order']
+            col_manually_rawdata_secloan = self.db_posttrddata['manually_rawdata_secloan']
+            list_to_upload = ['fund', 'holding', 'order', 'secloan']
+        else:   # update trd
+            col_manually_rawdata_fund = self.db_trddata['manually_rawdata_fund']
+            col_manually_rawdata_holding = self.db_trddata['manually_rawdata_holding']
+            col_manually_rawdata_order = self.db_trddata['manually_rawdata_order']
+            list_to_upload = ['fund', 'holding', 'order']
+
+        for _ in self.col_acctinfo.find({'DataDate': self.str_day, 'RptMark': 1}):
             datafilepath = _['DataFilePath']
 
             if datafilepath:
@@ -589,42 +654,54 @@ class ExposMonit:
                 downloaddatafilter = _['DownloadDataFilter']
                 data_source_type = _['DataSourceType']
                 accttype = _['AcctType']
-
-                for ch in ['capital', 'holding', 'secliability']:
-                    if ch == 'capital':
+                # print(acctidbybroker)
+                for ch in list_to_upload:
+                    if ch == 'fund':
                         fpath_relative = list_fpath_data[0]
-                        col_manually_rawdata = col_manually_rawdata_capital
+                        col_manually_rawdata = col_manually_rawdata_fund
                     elif ch == 'holding':
                         fpath_relative = list_fpath_data[1]
                         col_manually_rawdata = col_manually_rawdata_holding
-                    elif ch == 'secliability':
-                        # print(len(list_fpath_data))
-                        if len(list_fpath_data) > 2:  # 3
+                    elif ch == 'order':
+                        if len(list_fpath_data) > 2:  # 如果有sec，order必须空置 '; ; ;'形式
                             fpath_relative = list_fpath_data[2]
                             if fpath_relative:
-                                col_manually_rawdata = col_manually_rawdata_secliability
+                                col_manually_rawdata = col_manually_rawdata_order
+                            else:
+                                continue
+                        else:
+                            continue
+                    elif ch == 'secloan':
+                        # print(len(list_fpath_data))
+                        if len(list_fpath_data) > 3:  # 如果有sec，order必须空置 '; ; ;'形式
+                            fpath_relative = list_fpath_data[3]
+                            if fpath_relative:
+                                col_manually_rawdata = col_manually_rawdata_secloan
                             else:
                                 continue
                         else:
                             continue
                     else:
-                        raise ValueError('Value input not exist in capital and holding.')
+                        raise ValueError('Value input not exist in fund and holding.')
 
                     col_manually_rawdata.delete_many({'DataDate': self.str_day, 'AcctIDByMXZ': acctidbymxz})
                     # fpath_absolute = os.path.join(self.dirpath_data_from_trdclient, fpath_relative)
                     try:
                         if downloaddatafilter:      #  gtjy_pluto只有交易单元，没有账户名
                             acctidbybroker = downloaddatafilter
+
                         list_dicts_rec = self.read_rawdata_from_trdclient(
                             fpath_relative, ch, data_source_type, accttype, acctidbybroker
                         )
                         # there are some paths that I do not have access
                         for _ in list_dicts_rec:
-                            _['DataDate'] = datetime.datetime.today().strftime('%Y%m%d')
-                            _['UpdateTime'] = self.dt_day.strftime('%H:%M:%S')
+                            # if data_source_type == 'zx_wealthcats':
+                            #     print(_, fpath_relative)
+                            _['DataDate'] = self.str_day
+                            _['UpdateTime'] = self.record_update_raw_time
                             _['AcctIDByMXZ'] = acctidbymxz
                             _['AcctType'] = accttype
-                            _['DataFilePath'] = data_source_type
+                            _['DataSourceType'] = data_source_type
                         if list_dicts_rec:
                             col_manually_rawdata.insert_many(list_dicts_rec)
                     except FileNotFoundError:
@@ -635,26 +712,26 @@ class ExposMonit:
     def update_trddata_f(self):
         cursor_find = list(self.col_acctinfo.find({'DataDate': self.str_day, 'AcctType': 'f', 'RptMark': 1}))
         for _ in cursor_find:
-            list_future_data_capital = []
+            list_future_data_fund = []
             list_future_data_holding = []
             list_future_data_trdrec = []
             prdcode = _['PrdCode']
             acctidbymxz = _['AcctIDByMXZ']
             acctidbyowj = _['AcctIDByOuWangJiang4FTrd']
             trader = Trader(acctidbyowj)
-            dict_res_capital = trader.query_capital()
-            if dict_res_capital:
-                dict_capital_to_be_update = dict_res_capital
-                dict_capital_to_be_update['DataDate'] = self.str_day
-                dict_capital_to_be_update['AcctIDByMXZ'] = acctidbymxz
-                dict_capital_to_be_update['AcctIDByOWJ'] = acctidbyowj
-                dict_capital_to_be_update['PrdCode'] = prdcode
-                list_future_data_capital.append(dict_capital_to_be_update)
-                self.db_trddata['future_api_capital'].delete_many(
+            dict_res_fund = trader.query_capital()
+            if dict_res_fund:
+                dict_fund_to_be_update = dict_res_fund
+                dict_fund_to_be_update['DataDate'] = self.str_day
+                dict_fund_to_be_update['AcctIDByMXZ'] = acctidbymxz
+                dict_fund_to_be_update['AcctIDByOWJ'] = acctidbyowj
+                dict_fund_to_be_update['PrdCode'] = prdcode
+                list_future_data_fund.append(dict_fund_to_be_update)
+                self.db_trddata['future_api_fund'].delete_many(
                     {'DataDate': self.str_day, 'AcctIDByMXZ': acctidbymxz}
                 )
-                if list_future_data_capital:
-                    self.db_trddata['future_api_capital'].insert_many(list_future_data_capital)
+                if list_future_data_fund:
+                    self.db_trddata['future_api_fund'].insert_many(list_future_data_fund)
 
             list_list_res_holding = trader.query_holding()
             list_keys_holding = [
@@ -694,10 +771,11 @@ class ExposMonit:
             # print(f'{acctidbymxz} update finished!')
 
     def update_close_from_wind(self):
+        print(w.wset("sectorconstituent", f"date={self.str_day};sectorid=a599010000000000"))
         list_astock_codes = w.wset("sectorconstituent", f"date={self.str_day};sectorid=a001010100000000").Data[1]
         # list_bond_codes = w.wset("sectorconstituent", f"date={self.str_day};sectorid=a100000000000000").Data[1]
         list_futures_codes = w.wset("sectorconstituent", f"date={self.str_day};sectorid=a599010000000000").Data[1]
-
+        # 期货sectorid CFFEX, SHFE, DCE, CZCE;能源期货  全部期货用不了了
         list_etf_codes = ['000300.SH', '000016.SH', '000905.SH']  # index ETF that we use
         list_bond_codes = []
         list_repo_codes = []
@@ -721,39 +799,54 @@ class ExposMonit:
             print(err, close_data_from_wind)
             return {}
 
-    def update_order_last_from_wind(self, list_secid_query):
+    def get_order_last_from_wind(self, list_secid_query):
         # we do query only for securities in our account, secid should be type of wind
-        # 根据我们已经有的成交搜索last price，或者看最近一分钟成交价？ --- 在list里
-        start_time = (datetime.datetime.today()-datetime.timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
-        end_time = datetime.datetime.today().strftime("%Y-%m-%d %H:%M:%S")
+        # w.wsq("600000.SH", "rt_last,rt_latest", func=DemoWSQCallback)
         docs = []
         dict_wcode2last = {}
-        for secid in list_secid_query:
-            last_from_wind = w.wst(secid, "last", start_time, end_time)
-            # 经常莫名其妙报错...service connection failed，数据也可能错...
-            if last_from_wind.ErrorCode == 0:
-                date_str = last_from_wind.Times[-1].strftime("%Y-%m-%d %H:%M:%S")  # datetime.datetime
-                last = last_from_wind.Data[0][-1]
-                doc = {'TransactTime': date_str, 'LastPx': last, 'wind_code': secid}  # 需要 time, last. sec_name???
+        while self.record_position_query_time is None:
+            time.sleep(1)
+        # in the test mode, we monitor history last data
+            # 这个非常非常慢2000近多个证券要获得, 以后变成false
+            # start_time = self.dt_day.strftime("%Y-%m-%d") + " " + self.record_wind_query_time
+            # end_time = self.dt_day.strftime("%Y-%m-%d") + " " + self.record_position_query_time  # 在raw之后就不再None
+            # self.record_wind_query_time = self.record_position_query_time
+            # for secid in list_secid_query:
+            #     last_from_wind = w.wst(secid, "last", start_time, end_time)
+            #     # print(last_from_wind)
+            #     # 经常莫名其妙报错...service connection failed，数据也可能错...
+            #     if last_from_wind.ErrorCode == 0:
+            #         date = last_from_wind.Times[-1]  # datetime.datetime
+            #         last = last_from_wind.Data[0][-1]
+            #         print(last)
+            #         doc = {'TransactTime': date.strftime("%H:%M:%S"), 'DataDate': date.strftime("%Y%m%d"),
+            #                'LastPx': last, 'WindCode': secid}  # 需要 time, last. sec_name???
+            #         docs.append(doc)
+            #         dict_wcode2last.update({secid: last})
+            #     elif last_from_wind.ErrorCode == -40520010:  # Server Not Found Data Error
+            #         pass   # maybe there's no transaction
+            #     else:  # service connection error
+            #         # or pass; or verify the data is not in wind system
+            #         raise Exception(last_from_wind.Data)
+        last_from_wind = w.wsq(list_secid_query, "rt_last")   # 实时快照现价
+        if last_from_wind.ErrorCode == 0:
+            dict_wcode2last = dict(zip(last_from_wind.Codes, last_from_wind.Data[0]))
+            for key in dict_wcode2last:
+                date = last_from_wind.Times[0]
+                doc = {'TransactTime': date.strftime("%H:%M:%S"), 'DataDate': date.strftime("%Y%m%d"),
+                       'LastPx': dict_wcode2last[key], 'WindCode': key}
                 docs.append(doc)
-                dict_wcode2last.update({secid: last})
-            elif last_from_wind.ErrorCode == -40520010:
-                pass   # maybe during 1 minute there's no transaction
-            else:  # service connection error
-                # or pass; or verify the data is not in wind system
-                print(secid, last_from_wind.ErrorCode)
-        self.db_trddata['wind_last'].insert_many(docs)
+        elif last_from_wind.ErrorCode == -40520010:
+            pass
+        else:
+            raise Exception(last_from_wind.Data[0][0])  # Error Msg here
+        if docs:
+            self.db_trddata['wind_last'].insert_many(docs)
         return dict_wcode2last
-
-    def update_postdata(self):
-        # todo : 每天21：30 - 8：30之间使用
-        #  类似 updateraw，但仅仅选取上传field！
-        # 主要是security loan: short部分，其余不需要
-        return
 
     @staticmethod
     def get_sectype_from_code(windcode):
-        # todo simplify the cases!
+        # todo adapt the cases!
         list_split_wcode = windcode.split('.')
         secid = list_split_wcode[0]
         exchange = list_split_wcode[1]
@@ -791,270 +884,81 @@ class ExposMonit:
         else:
             raise ValueError(f'{windcode} has unknown exchange or digit number is not 6.')
 
+    @run_every_30s
     def update_fmtdata(self):
 
-        # todo list: 1. 改close相关公式, 2.简化函数（不必要的fields），去掉patch，去掉b/s
-        #  3.添加新加入的 list_fields，改格式 4.last price 获取记录  5.postdata + last算出 short（之前的算法改动）
-
         # set_index: 将WindCode列设做index, to_dict之后是:{col:{index:value}}形式数据
+        # todo check下新加在list_fields里的
 
+        self.record_fmt_time = datetime.datetime.today().strftime('%H:%M:%S')
         list_dicts_acctinfo = list(
-            self.col_acctinfo.find({'DataDate': self.str_day, 'RptMark': 1}, {'_id': 0}))  # {'_id': 0}隐藏
+            self.col_acctinfo.find({'DataDate': self.str_day, 'RptMark': 1}))  # {'_id': 0}隐藏
 
-        list_dicts_capital_fmtted = []
+        list_dicts_fund_fmtted = []
         list_dicts_holding_fmtted = []
-        list_dicts_secliability_fmtted = []
-        list_dicts_future_captial_fmtted = []
+        list_dicts_future_fund_fmtted = []
         list_dicts_future_position_fmtted = []
+        list_dicts_order_fmtted = []
+        # list_dicts_secloan_fmtted = []
 
         for dict_acctinfo in list_dicts_acctinfo:
-            prdcode = dict_acctinfo['PrdCode']
             acctidbymxz = dict_acctinfo['AcctIDByMXZ']
             accttype = dict_acctinfo['AcctType']
-            if accttype in ['c', 'm', 'o']:
+            if accttype in ['c', 'm', 'o'] and (not self.clearing):
                 # patchmark = dict_acctinfo['PatchMark']
                 # todo 有的券商的secloan要补上 - PatchMark；有的则是场外交易；还得写Patch函数
-                # 1.整理holding
-                # 1.1 rawdata(无融券合约账户)
-                list_dicts_holding = list(self.db_trddata['manually_rawdata_holding'].find(
-                    {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}, {'_id': 0}
-                ))
-                list_fields_secid = ['代码', '证券代码']
-                list_fields_symbol = ['证券名称']
-                list_fields_shareholder_acctid = ['股东帐户', '股东账号', '股东代码']
-                list_fields_exchange = ['市场', '交易市场', '交易板块', '板块', '交易所', '交易所名称']
-                # 有优先级别的列表
-                list_fields_longqty = [
-                    '股票余额', '拥股数量', '证券余额', '证券数量', '库存数量', '持仓数量', '参考持股', '持股数量', '当前持仓',
-                    '当前余额', '实际数量', '实时余额'
-                ]
 
-                for dict_holding in list_dicts_holding:  # 不必 list_dicts_holding.keys()
-                    secid = None
-                    secidsrc = None
-                    symbol = None
-                    longqty = 0
-                    # shortqty = 0
-                    for field_secid in list_fields_secid:
-                        if field_secid in dict_holding:
-                            secid = str(dict_holding[field_secid])
-
-                    for field_shareholder_acctid in list_fields_shareholder_acctid:
-                        if field_shareholder_acctid in dict_holding:
-                            shareholder_acctid = str(dict_holding[field_shareholder_acctid])
-                            if shareholder_acctid[0].isalpha():
-                                secidsrc = 'SSE'
-                            if shareholder_acctid[0].isdigit():
-                                secidsrc = 'SZSE'
-
-                    for field_exchange in list_fields_exchange:
-                        if field_exchange in dict_holding:
-                            exchange = dict_holding[field_exchange]
-                            dict_exchange2secidsrc = {'深A': 'SZSE', '沪A': 'SSE',
-                                                      '深Ａ': 'SZSE', '沪Ａ': 'SSE',
-                                                      '上海Ａ': 'SSE', '深圳Ａ': 'SZSE',
-                                                      '00': 'SZSE', '10': 'SSE',
-                                                      '0': 'SZSE', '1': 'SSE',
-                                                      '上海Ａ股': 'SSE', '深圳Ａ股': 'SZSE',
-                                                      '上海A股': 'SSE', '深圳A股': 'SZSE',
-                                                      'SH': 'SSE', 'SZ': 'SZSE'
-                                                      }
-                            secidsrc = dict_exchange2secidsrc[exchange]
-                    for field_symbol in list_fields_symbol:
-                        if field_symbol in dict_holding:
-                            symbol = str(dict_holding[field_symbol])
-
-                    for field_longqty in list_fields_longqty:
-                        if field_longqty in dict_holding:
-                            longqty = float(dict_holding[field_longqty])
-
-                    windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
-                    windcode = secid + windcode_suffix
-                    sectype = self.get_sectype_from_code(windcode)
-                    if sectype == 'IrrelevantItem':
-                        continue
-                    if windcode in self.dict_wcode2close:
-                        close = self.dict_wcode2close[windcode]
-                    else:
-                        print(f'{windcode} not found in dict_wcode2close.')
-                        close = 0
-                    if close is None:
-                        print(f'{windcode} not found in dict_wcode2close.')
-                        close = 0
-                    longamt = close * longqty
-
-                    if accttype in ['c', 'f', 'o']:
-                        cash_from_ss_in_holding_fmtted = None
-                    elif accttype in ['m']:
-                        cash_from_ss_in_holding_fmtted = 0
-                    else:
-                        raise ValueError('Unknown accttype.')
-
-                    dict_holding_fmtted = {
-                        'DataDate': self.str_day,
-                        'AcctIDByMXZ': acctidbymxz,
-                        'SecurityID': secid,
-                        'SecurityType': sectype,
-                        'Symbol': symbol,
-                        'SecurityIDSource': secidsrc,
-                        'LongQty': longqty,
-                        'ShortQty': 0,
-                        'LongAmt': longamt,
-                        'ShortAmt': 0,
-                        'NetAmt': longamt,
-                        'CashFromShortSelling': 0
-                    }
-                    list_dicts_holding_fmtted.append(dict_holding_fmtted)
-
-                # 处理融券合约账户
-                list_dicts_secliability = list(self.db_trddata['manually_rawdata_secliability'].find(
-                    {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}, {'_id': 0}
-                ))
-                shortqty_from_ss = 0  # ss = Short selling； 注： 为余额，是未偿还额
-                shortqty_from_equity_compensation = 0  # 注： 是余额
-                cash_from_ss_in_dict_secliability = 0
-                list_fields_shortqty_from_ss = ['剩余数量']
-                list_fields_shortqty_from_equity_compensation = ['权益补偿数量']  # 权益补偿数量，来自于股票分红，zhaos_tdx中该值为余额
-                list_fields_ss_avgprice = ['卖均价']
-                list_fields_cash_from_short_selling = ['融券卖出成本']  # CashFromShortSelling
-                list_fields_shortqty = ['real_compact_amount','未还负债数量', '未还合约数量']
-
-                list_secid_query = []
-
-                for dict_secliability in list_dicts_secliability:
-                    secid = None
-                    secidsrc = None
-                    symbol = None
-                    shortqty = None
-                    # longqty = 0
-                    for field_secid in list_fields_secid:
-                        if field_secid in dict_secliability:
-                            secid = str(dict_secliability[field_secid])
-
-                    for field_shareholder_acctid in list_fields_shareholder_acctid:
-                        if field_shareholder_acctid in dict_secliability:
-                            shareholder_acctid = dict_secliability[field_shareholder_acctid]
-                            if shareholder_acctid[0].isalpha():
-                                secidsrc = 'SSE'
-                            if shareholder_acctid[0].isdigit():
-                                secidsrc = 'SZSE'
-
-                    for field_exchange in list_fields_exchange:
-                        if field_exchange in dict_secliability:
-                            exchange = dict_secliability[field_exchange]
-                            dict_exchange2secidsrc = {'深A': 'SZSE', '沪A': 'SSE',
-                                                      '深Ａ': 'SZSE', '沪Ａ': 'SSE',
-                                                      '上海Ａ': 'SSE', '深圳Ａ': 'SZSE',
-                                                      '00': 'SZSE', '10': 'SSE',
-                                                      '上海Ａ股': 'SSE', '深圳Ａ股': 'SZSE',
-                                                      '上海A股': 'SSE', '深圳A股': 'SZSE',
-                                                      }
-                            secidsrc = dict_exchange2secidsrc[exchange]
-                    for field_symbol in list_fields_symbol:
-                        if field_symbol in dict_secliability:
-                            symbol = str(dict_secliability[field_symbol])
-
-                    for field_shortqty in list_fields_shortqty:
-                        if field_shortqty in dict_secliability:
-                            shortqty = int(dict_secliability[field_shortqty])
-                    if not shortqty:  # not None
-                        for field_shortqty_from_ss in list_fields_shortqty_from_ss:
-                            if field_shortqty_from_ss in dict_secliability:
-                                shortqty_from_ss = float(dict_secliability[field_shortqty_from_ss])
-
-                        for field_shortqty_from_equity_compensation in list_fields_shortqty_from_equity_compensation:
-                            if field_shortqty_from_equity_compensation in dict_secliability:
-                                shortqty_from_equity_compensation = float(
-                                    dict_secliability[field_shortqty_from_equity_compensation])
-                        shortqty = shortqty_from_ss + shortqty_from_equity_compensation
-
-                        for field_ss_avgprice in list_fields_ss_avgprice:
-                            if field_ss_avgprice in dict_secliability:
-                                ss_avgprice = float(dict_secliability[field_ss_avgprice])
-                                cash_from_ss_in_dict_secliability = shortqty_from_ss * ss_avgprice
-
-                    for field_cash_from_short_selling in list_fields_cash_from_short_selling:
-                        if field_cash_from_short_selling in dict_secliability:
-                            cash_from_ss_in_dict_secliability = float(dict_secliability[field_cash_from_short_selling])
-
-                    windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
-                    windcode = secid + windcode_suffix
-                    sectype = self.get_sectype_from_code(windcode)
-                    if sectype == 'IrrelevantItem':
-                        continue
-                    list_secid_query.append(windcode)
-                    # close = dict_wcode2close[windcode]   # 改成last...
-                    # todo 加上updateTime， 也许和holding直接并入position，不留中间过程...
-                    dict_secliability_fmtted = {
-                        'DataDate': self.str_day,
-                        'AcctIDByMXZ': acctidbymxz,
-                        'SecurityID': secid,
-                        'SecurityType': sectype,
-                        'Symbol': symbol,
-                        'SecurityIDSource': secidsrc,
-                        'LongQty': 0,
-                        'ShortQty': shortqty,
-                        'LongAmt': 0,
-                        'ShortAmt': None,   # to calculate after we have last price
-                        'NetAmt': None,
-                        'CashFromShortSelling': cash_from_ss_in_dict_secliability,
-                        'windcode': windcode
-                    }
-                    list_dicts_secliability_fmtted.append(dict_secliability_fmtted)
-
-                dict_wcode2last = self.update_order_last_from_wind(list_secid_query)
-                for dict_secliability_fmtted in list_dicts_secliability_fmtted:
-                    windcode = dict_secliability_fmtted['windcode']
-                    last = dict_wcode2last[windcode]
-                    shortqty = dict_secliability_fmtted['ShortQty']
-                    dict_secliability_fmtted['ShortAmt'] = last * shortqty
-                    dict_secliability_fmtted['NetAmt'] = - last * shortqty
-                    del dict_secliability_fmtted['windcode']
-
-                # 2.2 求cash
-                list_dicts_capital = list(self.db_trddata['manually_rawdata_capital'].find(
-                    {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}, {'_id': 0}
+                # 1.cash
+                list_dicts_fund = list(self.db_trddata['manually_rawdata_fund'].find(
+                    {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'UpdateTime': {'$gte': self.record_update_raw_time}}
                 ))  # 为啥之前find_one?
-                if list_dicts_capital is None:
-                    list_dicts_capital = []
-                list_fields_avfund = ['可用', '可用数', '现金资产', '可用金额', '资金可用金', '可用余额', 'T+1指令可用金额']
-                list_fields_ttasset = ['总资产', '资产', '总 资 产', '单元总资产', '账户总资产', '担保资产']
-                list_fields_cb = []     # 券商没义务提供，得从postdata里找
-                list_fields_mktvalue = []   # 券商没义务提供，得按long-short算
+                # print(list_dicts_fund)
+                if list_dicts_fund is None:
+                    list_dicts_fund = []
+                list_fields_af = ['可用', 'A股可用', '可用数', '现金资产', '可用金额', '资金可用金', '可用余额', 'T+1指令可用金额',
+                                  'enable_balance', 'fund_asset', '可用资金']
+                # 新加：matic_tsi_RZRQ: fund_asset, gtja_pluto:可用资金
+                list_fields_ttasset = ['总资产', '资产', '总 资 产', '实时总资产', '单元总资产', '资产总额', '账户总资产',
+                                       '担保资产', 'asset_balance', 'assure_asset']
+                # list_fields_cb = []     # 券商没义务提供，得从postdata里找
+                # list_fields_mktvalue = []   # 券商没义务提供，得按long-short算
 
-                list_dicts_capital_fmtted = []
-                for dict_capital in list_dicts_capital:
-                    cash_balance = None   # 'CashBalance'
+                list_dicts_fund_fmtted = []
+                for dict_fund in list_dicts_fund:
                     avfund = None  # 'AvailableFund'
                     ttasset = None  # 'TotalAsset'
-                    mktvalue = None  # 'TotalMarketValue'
+
                     # flt_approximate_na?
 
                     # 分两种情况： 1. cash acct: 至少要有cash 2. margin acct: 至少要有ttasset
-                    for field_cb in list_fields_cb:
-                        if field_cb in dict_capital:
-                            cash_balance = dict_capital[field_cb]
-
                     if accttype in ['c']:
-                        for field_af in list_fields_avfund:
-                            if field_af in dict_capital:
-                                avfund = float(dict_capital[field_af])
-                            else:
-                                pass
-                                # todo patchdata capital 处理 要Debt吗? - secliability 关联？
+                        flag_check_new_name = True    # 用来弥补之前几个list的缺漏
+                        for field_af in list_fields_af:
+                            if field_af in dict_fund:
+                                avfund = float(dict_fund[field_af])
+                                # todo patchdata fund 处理 要Debt吗? - secloan 关联？
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_fund)
+                            raise KeyError('unknown available_fund name (cash)')
 
                     elif accttype == 'm':
+                        flag_check_new_name = True
                         for field_ttasset in list_fields_ttasset:
-                            if field_ttasset in dict_capital:
-                                ttasset = float(dict_capital[field_ttasset])
-                        for field_mktvalue in list_fields_mktvalue:
-                            if field_mktvalue in dict_capital:
-                                mktvalue = float(dict_capital[field_mktvalue])
-                        for field_avfund in list_fields_avfund:
-                            if field_avfund in dict_capital:
-                                avfund = float(dict_capital[field_avfund])
-                                if abs(avfund + mktvalue - ttasset) > 0.01:
-                                    print('TotalAsset does not equal to TotalMarketValue - AvailableFund')
+                            if field_ttasset in dict_fund:
+                                ttasset = float(dict_fund[field_ttasset])
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_fund)
+                            raise KeyError('unknown total asset name')
+                        flag_check_new_name = True
+                        for field_avfund in list_fields_af:
+                            if field_avfund in dict_fund:
+                                avfund = float(dict_fund[field_avfund])
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_fund)
+                            raise KeyError('unknown available_fund name (margin)')
 
                         # flt_cash = flt_ttasset - stock_longamt - etf_longamt - ce_longamt
 
@@ -1064,57 +968,1208 @@ class ExposMonit:
                     else:
                         raise ValueError('Unknown accttype')
 
-                    dict_capital_fmtted = {
+                    dict_fund_fmtted = {
                         'DataDate': self.str_day,
+                        'UpdateTime': self.record_fmt_time,
                         'AcctIDByMXZ': acctidbymxz,
-                        'CashBalance': cash_balance,
+                        'CashBalance': None,
                         'AvailableFund': avfund,  # flt_approximate_na?
                         'TotalAsset': ttasset,
-                        'TotalMarketValue': mktvalue   # 总股本*每股价值 = 证券市值
+                        'TotalMarketValue': None  # 总股本*每股价值 = 证券市值, 之后补上
                     }
-                    list_dicts_capital_fmtted.append(dict_capital_fmtted)
+                    list_dicts_fund_fmtted.append(dict_fund_fmtted)
 
-                # 2.3 cash equivalent: ce_longamt
-                # flt_ce = ce_longamt
+                # 2.整理holding
+                # 2.1 rawdata(无融券合约账户)
+                list_dicts_holding = list(self.db_trddata['manually_rawdata_holding'].find(
+                    {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'UpdateTime': {'$gte': self.record_update_raw_time}}
+                ))
+                # if list_dicts_holding:
+                #     print('1006 OK')
+                # else:
+                #     print('1006 not OK')
+                list_fields_secid = ['代码', '证券代码', 'stock_code']
+                list_fields_symbol = ['证券名称', 'stock_name', '股票名称']
+                list_fields_shareholder_acctid = ['股东帐户', '股东账号', '股东代码']
+                list_fields_exchange = ['市场', '市场代码', '交易市场', '交易板块', '板块', '交易所', '交易所名称', '交易市场',
+                                        'exchange_type']
 
-                # 2.4 etf
-                # flt_etf_long_amt = etf_longamt
+                # 有优先级别的列表
+                list_fields_longqty = [
+                    '股票余额', '拥股数量', '证券余额', '证券数量', '库存数量', '持仓数量', '参考持股', '持股数量', '当前持仓',
+                    '当前余额', '当前拥股', '实际数量', '实时余额', 'current_amount'
+                ]
 
-                # 2.4 CompositeLongAmt
-                # flt_composite_long_amt = stock_longamt
+                for dict_holding in list_dicts_holding:  # 不必 list_dicts_holding.keys()
+                    secid = None
+                    secidsrc = None
+                    symbol = None
+                    longqty = 0
+                    # shortqty = 0
+                    flag_check_new_name = True
+                    for field_secid in list_fields_secid:
+                        if field_secid in dict_holding:
+                            secid = str(dict_holding[field_secid])
+                            flag_check_new_name = False
+                    if flag_check_new_name:
+                        print(dict_holding)
+                        raise KeyError('unknown available_fund name')
 
-                # 2.5 SwapAmt 不考虑互换
+                    flag_check_new_name = True
+                    for field_shareholder_acctid in list_fields_shareholder_acctid:
+                        if field_shareholder_acctid in dict_holding:
+                            shareholder_acctid = str(dict_holding[field_shareholder_acctid])
+                            if shareholder_acctid[0].isalpha():
+                                secidsrc = 'SSE'
+                            if shareholder_acctid[0].isdigit():
+                                secidsrc = 'SZSE'
+                            flag_check_new_name = False
 
-                # 2.5 Asset
-                # flt_ttasset = flt_cash + flt_ce + flt_etf_long_amt + flt_composite_long_amt + flt_swap_amt2asset
+                    for field_exchange in list_fields_exchange:
+                        if field_exchange in dict_holding:
+                            exchange = dict_holding[field_exchange]
+                            dict_exchange2secidsrc = {'深A': 'SZSE', '沪A': 'SSE',
+                                                      '深Ａ': 'SZSE', '沪Ａ': 'SSE',
+                                                      '上海Ａ': 'SSE', '深圳Ａ': 'SZSE',
+                                                      '00': 'SZSE', '10': 'SSE',
+                                                      '0': 'SZSE', '1': 'SSE', '2': 'SZSE',
+                                                      '上海Ａ股': 'SSE', '深圳Ａ股': 'SZSE',
+                                                      '上海A股': 'SSE', '深圳A股': 'SZSE',
+                                                      'SH': 'SSE', 'SZ': 'SZSE',
+                                                      '上交所A': 'SSE', '深交所A': 'SZSE',
+                                                      }
+                            secidsrc = dict_exchange2secidsrc[exchange]
+                            flag_check_new_name = False
+                    if flag_check_new_name:
+                        print(dict_holding)
+                        raise KeyError('unknown security source name')
 
-                # 2.6 etf_shortamt
-                # flt_etf_short_amt = etf_shortamt
+                    flag_check_new_name = True
+                    for field_symbol in list_fields_symbol:
+                        if field_symbol in dict_holding:
+                            symbol = str(dict_holding[field_symbol])
+                            flag_check_new_name = False
+                    if flag_check_new_name:
+                        print(dict_holding)
+                        raise KeyError('unknown symbol name')
 
-                # 2.7 stock_shortamt
-                # flt_composite_short_amt = stock_shortamt
+                    flag_check_new_name = True
+                    for field_longqty in list_fields_longqty:
+                        if field_longqty in dict_holding:
+                            longqty = float(dict_holding[field_longqty])
+                            flag_check_new_name = False
+                    if flag_check_new_name:
+                        print(dict_holding)
+                        raise KeyError('unknown longqty name')
 
-                # 2.8 liability
-                # liability = 融券负债（利息+本金）+ 融资负债（利息+本金）+ 场外合约形成的负债（交易性金融负债）
-                # if flt_capital_debt is None:
-                #     flt_capital_debt = 0
-                # flt_liability = (
-                #         float(df_holding_fmtted_patched['Liability'].sum()) + flt_capital_debt + flt_swap_amt2liability
-                # )
 
-                # 2.9 net_asset
-                # flt_approximate_na = flt_ttasset - flt_liability
+                    windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
+                    windcode = secid + windcode_suffix
+                    sectype = self.get_sectype_from_code(windcode)
 
-                # exposure_long_amt = flt_etf_long_amt + flt_composite_long_amt + underlying_exposure_long
-                # exposure_short_amt = flt_etf_short_amt + flt_composite_short_amt + underlying_exposure_short
-                # exposure_net_amt = exposure_long_amt - exposure_short_amt
+                    dict_holding_fmtted = {
+                        'DataDate': self.str_day,
+                        'UpdateTime': self.record_fmt_time,
+                        'AcctIDByMXZ': acctidbymxz,
+                        'SecurityID': secid,
+                        'SecurityType': sectype,
+                        'Symbol': symbol,
+                        'SecurityIDSource': secidsrc,
+                        'LongQty': longqty,
+                        'ShortQty': 0,
+                        'LongAmt': None,
+                        'ShortAmt': 0,
+                        'NetAmt': None
+                    }
+                    list_dicts_holding_fmtted.append(dict_holding_fmtted)
 
-            #  todo 这个部分放到position处理里
-            elif accttype in ['f']:
-                # 按acctidbymxz exposure数据
-                list_dicts_holding_future = list(
-                    self.db_trddata['future_api_holding'].find({'DataDate': self.str_day, 'AcctIDByMXZ': acctidbymxz})
+                # 3.order
+                list_dicts_order = list(self.db_trddata['manually_rawdata_order'].find(
+                    {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'UpdateTime': {'$gte': self.record_update_raw_time}}
+                ))
+                # if list_dicts_holding:
+                #     print('1106 OK')
+                # else:
+                #     print('1106 not OK')
+
+                # todo 新加了 ：hait_xtpb; huat_matic;gj_pluto无XQHQ仅方向;
+                #  zxjt_xtpb, zhaos_xtpb只有deal无order
+                list_fields_cumqty = ['成交数量', 'business_amount']
+                list_fields_side_c = ['买卖标记', 'entrust_bs', '委托方向']
+                list_fields_side_m = ['买卖标记', 'trade_name', '委托方向']  # entrust_bs在matic_m里有，但是不详细
+                list_fields_orderqty = ['委托量', 'entrust_amount', '委托数量']   # XXX_deal 会给不了委托量，委托日期，委托时间，只有成交
+                list_fields_tradedate = ['委托日期', 'init_date']  # matic_m无entrust_date
+                list_fields_transtime = ['委托时间', 'entrust_time']
+                list_fields_avgpx = ['成交均价', 'business_price', '成交价格']   # 以后算balance用， exposure不用
+                list_fields_sernum = []     # serialnumber以后用, orderID?
+                dict_fmtted_side_name_c = {'buy': ['1', '买入'],  # 担保品=券； 限价去掉,含"...“即可
+                                           'sell': ['2', '卖出']}
+                dict_fmtted_side_name_m = {'buy': ['担保品买入', '1'],  # 担保品=券； 限价去掉,含"...“即可
+                                           'sell': ['担保品卖出', '2'],
+                                           'sell short': ['融券卖出'],  # 限价 limit-price
+                                           'XQHQ': ['现券还券划拨', '34'],
+                                           'MQHQ': ['买券还券划拨'],
+                                           'cancel': ['撤单']}  # entrust_bs表方向时值为1，2
+                list_date_format = ['%Y%m%d']
+                list_time_format = ['%H%M%S', '%H:%M:%S']
+                if accttype == 'c':
+                    dict_fmtted_side_name = dict_fmtted_side_name_c
+                    list_fields_side = list_fields_side_c
+                else:
+                    dict_fmtted_side_name = dict_fmtted_side_name_m
+                    list_fields_side = list_fields_side_m
+
+                for dict_order in list_dicts_order:
+                    secid = None
+                    secidsrc = None
+                    symbol = None
+                    cumqty = None
+                    side = None
+                    orderqty = None
+                    tradedate = None
+                    transtime = None
+                    avgpx = None
+                    flag_check_new_name = True
+                    for field_secid in list_fields_secid:
+                        if field_secid in dict_order:
+                            secid = str(dict_order[field_secid])
+                            flag_check_new_name = False
+                    if flag_check_new_name:
+                        print(dict_order)
+                        raise KeyError('unknown secid name')
+
+                    flag_check_new_name = True
+                    for field_shareholder_acctid in list_fields_shareholder_acctid:
+                        if field_shareholder_acctid in dict_order:
+                            shareholder_acctid = str(dict_order[field_shareholder_acctid])
+                            if shareholder_acctid[0].isalpha():
+                                secidsrc = 'SSE'
+                            if shareholder_acctid[0].isdigit():
+                                secidsrc = 'SZSE'
+                            flag_check_new_name = False
+
+                    for field_exchange in list_fields_exchange:
+                        if field_exchange in dict_order:
+                            exchange = dict_order[field_exchange]
+                            dict_exchange2secidsrc = {'深A': 'SZSE', '沪A': 'SSE',
+                                                      '深Ａ': 'SZSE', '沪Ａ': 'SSE',
+                                                      '上海Ａ': 'SSE', '深圳Ａ': 'SZSE',
+                                                      '00': 'SZSE', '10': 'SSE',
+                                                      '0': 'SZSE', '1': 'SSE', '2': 'SZSE',
+                                                      '上海Ａ股': 'SSE', '深圳Ａ股': 'SZSE',
+                                                      '上海A股': 'SSE', '深圳A股': 'SZSE',
+                                                      'SH': 'SSE', 'SZ': 'SZSE',
+                                                      '上交所A': 'SSE', '深交所A': 'SZSE',
+                                                      '上证所': 'SSE', '深交所': 'SZSE'}
+                            secidsrc = dict_exchange2secidsrc[exchange]
+                            flag_check_new_name = False
+                    if flag_check_new_name:
+                        print(dict_order)
+                        raise KeyError('unknown exchange name')
+
+                    flag_check_new_name = True
+                    for field_symbol in list_fields_symbol:
+                        if field_symbol in dict_order:
+                            symbol = str(dict_order[field_symbol])
+                            flag_check_new_name = False
+                    if flag_check_new_name:
+                        print(dict_order)
+                        raise KeyError('unknown symbol name')
+
+                    windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
+                    windcode = secid + windcode_suffix
+                    sectype = self.get_sectype_from_code(windcode)
+
+                    flag_check_new_name = True
+                    for field_cumqty in list_fields_cumqty:
+                        if field_cumqty in dict_order:
+                            cumqty = dict_order[field_cumqty]
+                            flag_check_new_name = False
+                    if flag_check_new_name:
+                        print(dict_order)
+                        raise KeyError('unknown cumqty name')
+
+                    flag_check_new_name = True
+                    for field_side in list_fields_side:
+                        if field_side in dict_order:
+                            side = dict_order[field_side]
+                            for key in dict_fmtted_side_name.keys():
+                                for side_name in dict_fmtted_side_name[key]:
+                                    if side_name in side:  # ex: '担保品买入' in '限价担保品买入'
+                                        side = key  # standardization
+                                        flag_check_new_name = False
+                    if flag_check_new_name:
+                        print(dict_order)
+                        raise KeyError('unknown side name')
+
+                    flag_check_new_name = True
+                    for field_orderqty in list_fields_orderqty:
+                        if field_orderqty in dict_order:
+                            orderqty = dict_order[field_orderqty]
+                            flag_check_new_name = False
+                    if flag_check_new_name:
+                        if dict_order['DataSourceType'] in ['zxjt_xtpb', 'zhaos_xtpb']:  # 他们给不了委托量
+                            pass
+                        else:
+                            print(dict_order)
+                            raise KeyError('unknown orderqty name')
+
+                    flag_check_new_name = True
+                    for field_tradedate in list_fields_tradedate:
+                        if field_tradedate in dict_order:
+                            tradedate = dict_order[field_tradedate]
+                            # 转化成统一时间格式
+                            datetime_obj = None
+                            for date_format in list_date_format:
+                                try:
+                                    datetime_obj = datetime.datetime.strptime(tradedate, date_format)
+                                except ValueError:
+                                    pass
+                            if datetime_obj:
+                                tradedate = datetime_obj.strftime('%Y%m%d')  # 统一成 str_day格式
+                            else:
+                                raise ValueError('Unrecognized trade date format')
+                            flag_check_new_name = False
+
+                    if flag_check_new_name:
+                        if dict_order['DataSourceType'] in ['zxjt_xtpb', 'zhaos_xtpb']:  # 他们给不了委托时间
+                            pass
+                        else:
+                            print(dict_order)
+                            raise KeyError('unknown tradedate name')
+
+                    flag_check_new_name = True
+                    for field_transtime in list_fields_transtime:
+                        if field_transtime in dict_order:
+                            transtime = dict_order[field_transtime]
+                            # 转化成统一时间格式
+                            datetime_obj = None
+                            for time_format in list_time_format:
+                                try:
+                                    datetime_obj = datetime.datetime.strptime(transtime, time_format)
+                                except ValueError:
+                                    pass
+                            if datetime_obj:
+                                transtime = datetime_obj.strftime('%H:%M:%S')
+                            else:
+                                raise ValueError('Unrecognized trade date format')
+                            flag_check_new_name = False
+                    if flag_check_new_name:
+                        if dict_order['DataSourceType'] in ['zxjt_xtpb', 'zhaos_xtpb']:  # 他们给不了委托时间
+                            pass
+                        else:
+                            print(dict_order)
+                            raise KeyError('unknown transaction time name')
+
+                    flag_check_new_name = True
+                    for field_avgpx in list_fields_avgpx:
+                        if field_avgpx in dict_order:
+                            avgpx = dict_order[field_avgpx]
+                            flag_check_new_name = False
+                            if avgpx == 0:   # 撤单
+                                cumqty = 0
+                    if flag_check_new_name:
+                        print(dict_order)
+                        raise KeyError('unknown average price name')
+
+                    dict_order_fmtted = {
+                        'DataDate': self.str_day,
+                        'UpdateTime': self.record_fmt_time,
+                        'AcctIDByMXZ': acctidbymxz,
+                        'SecurityID': secid,
+                        'SerialNumber': None,
+                        'SecurityType': sectype,
+                        'Symbol': symbol,
+                        'SecurityIDSource': secidsrc,
+                        'CumQty': cumqty,
+                        'Side': side,
+                        'OrdQty': orderqty,
+                        'TradeDate': tradedate,
+                        'TransactTime': transtime,
+                        'AvgPx': avgpx
+                    }
+
+                    list_dicts_order_fmtted.append(dict_order_fmtted)
+            elif accttype in ['f'] and not self.clearing:
+                list_dicts_future_fund = list(self.db_trddata['future_api_fund'].find(
+                    {'DataDate': self.str_day, 'AcctIDByMXZ': acctidbymxz}) # , 'UpdateTime': self.record_update_raw_time测试去掉
                 )
+                for dict_fund_future in list_dicts_future_fund:
+                    approximate_na = dict_fund_future['DYNAMICBALANCE']
+                    cash_balance = dict_fund_future['STATICBALANCE']
+                    acctidbymxz = dict_fund_future['AcctIDByMXZ']
+                    dict_future_fund_fmtted = {
+                        'DataDate': self.str_day,
+                        'UpdateTime': self.record_fmt_time,
+                        'AcctIDByMXZ': acctidbymxz,
+                        'CashBalance': cash_balance,
+                        'AvailableFund': approximate_na,  # flt_approximate_na?
+                        'TotalAsset': None,
+                        'TotalMarketValue': None  # 总股本*每股价值 = 证券市值
+                    }
+                    list_dicts_future_fund_fmtted.append(dict_future_fund_fmtted)
+                # 期货holding直接放到 position里
+            elif self.clearing:
+                pass
+            else:
+                raise ValueError('Unknown account type in basic account info.')
+        # 同一时刻的所有fmtdata只有一个，不然容易冗余
+        if list_dicts_fund_fmtted:
+            self.db_trddata['fmtdata_fund'].delete_many({'DataDate': self.str_day, 'UpdateTime': self.record_fmt_time})
+            self.db_trddata['fmtdata_fund'].insert_many(list_dicts_fund_fmtted)
+        if list_dicts_holding_fmtted:
+            self.db_trddata['fmtdata_holding'].delete_many({'DataDate': self.str_day, 'UpdateTime': self.record_fmt_time})
+            self.db_trddata['fmtdata_holding'].insert_many(list_dicts_holding_fmtted)
+            # print(list_dicts_holding_fmtted)
+        if list_dicts_order_fmtted:
+            self.db_trddata['fmtdata_order'].delete_many({'DataDate': self.str_day, 'UpdateTime': self.record_fmt_time})
+            self.db_trddata['fmtdata_order'].insert_many(list_dicts_order_fmtted)
+            # print(list_dicts_order_fmtted)
+        if list_dicts_future_fund_fmtted:
+            self.db_trddata['fmtdata_fund'].insert_many(list_dicts_future_fund_fmtted)
+
+        self.record_update_raw_time = None  # 下个循环也让他等update_raw开始一秒
+        # print('Update fund and holding formatted by internal style finished.')
+        return
+
+    def update_fmtpostdata(self):
+
+        # set_index: 将WindCode列设做index, to_dict之后是:{col:{index:value}}形式数据
+        if self.clearing:
+            list_dicts_acctinfo = list(
+                self.col_acctinfo.find({'DataDate': self.str_day, 'RptMark': 1}))  # {'_id': 0}隐藏
+
+            list_dicts_fund_fmtted = []
+            list_dicts_holding_fmtted = []
+            list_dicts_order_fmtted = []
+            list_dicts_secloan_fmtted = []
+
+            for dict_acctinfo in list_dicts_acctinfo:
+                acctidbymxz = dict_acctinfo['AcctIDByMXZ']
+                accttype = dict_acctinfo['AcctType']
+                if accttype in ['c', 'm', 'o']:
+                    # patchmark = dict_acctinfo['PatchMark']
+                    # todo 有的券商的secloan要补上 - PatchMark；有的则是场外交易；还得写Patch函数
+
+                    # 1.cash
+                    list_dicts_fund = list(self.db_posttrddata['manually_rawdata_fund'].find(
+                        {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}
+                    ))  # 为啥之前find_one?
+                    if list_dicts_fund is None:
+                        list_dicts_fund = []
+                    list_fields_af = ['可用', 'A股可用', '可用数', '现金资产', '可用金额', '资金可用金', '可用余额', 'T+1指令可用金额',
+                                      'enable_balance', 'fund_asset', '可用资金']
+                    # 新加：matic_tsi_RZRQ: fund_asset, gtja_pluto:可用资金
+                    list_fields_ttasset = ['总资产', '资产', '总 资 产', '实时总资产', '单元总资产', '资产总额', '账户总资产',
+                                           '担保资产', 'asset_balance', 'assure_asset']
+                    # list_fields_cb = []     # 券商没义务提供，得从postdata里找
+                    # list_fields_mktvalue = []   # 券商没义务提供，得按long-short算
+
+                    list_dicts_fund_fmtted = []
+                    for dict_fund in list_dicts_fund:
+                        avfund = None  # 'AvailableFund'
+                        ttasset = None  # 'TotalAsset'
+
+                        # flt_approximate_na?
+
+                        # 分两种情况： 1. cash acct: 至少要有cash 2. margin acct: 至少要有ttasset
+                        if accttype in ['c']:
+                            flag_check_new_name = True  # 用来弥补之前几个list的缺漏
+                            for field_af in list_fields_af:
+                                if field_af in dict_fund:
+                                    avfund = float(dict_fund[field_af])
+                                    # todo patchdata fund 处理 要Debt吗? - secloan 关联？
+                                    flag_check_new_name = False
+                            if flag_check_new_name:
+                                print(dict_fund)
+                                raise KeyError('unknown available_fund name (cash)')
+
+                        elif accttype == 'm':
+                            flag_check_new_name = True
+                            for field_ttasset in list_fields_ttasset:
+                                if field_ttasset in dict_fund:
+                                    ttasset = float(dict_fund[field_ttasset])
+                                    flag_check_new_name = False
+                            if flag_check_new_name:
+                                print(dict_fund)
+                                raise KeyError('unknown total asset name')
+                            flag_check_new_name = True
+                            for field_avfund in list_fields_af:
+                                if field_avfund in dict_fund:
+                                    avfund = float(dict_fund[field_avfund])
+                                    flag_check_new_name = False
+                            if flag_check_new_name:
+                                print(dict_fund)
+                                raise KeyError('unknown available_fund name (margin)')
+
+                            # flt_cash = flt_ttasset - stock_longamt - etf_longamt - ce_longamt
+
+                        elif accttype == 'o':
+                            # todo patch 里场外暂时放放
+                            pass
+                        else:
+                            raise ValueError('Unknown accttype')
+
+                        dict_fund_fmtted = {
+                            'DataDate': self.str_day,
+                            'AcctIDByMXZ': acctidbymxz,
+                            'CashBalance': None,
+                            'AvailableFund': avfund,  # flt_approximate_na?
+                            'TotalAsset': ttasset,
+                            'TotalMarketValue': None  # 总股本*每股价值 = 证券市值, 之后补上
+                        }
+                        list_dicts_fund_fmtted.append(dict_fund_fmtted)
+
+                    # 2.整理holding
+                    # 2.1 rawdata(无融券合约账户)
+                    list_dicts_holding = list(self.db_posttrddata['manually_rawdata_holding'].find(
+                        {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}
+                    ))
+                    list_fields_secid = ['代码', '证券代码', 'stock_code']
+                    list_fields_symbol = ['证券名称', 'stock_name', '股票名称']
+                    list_fields_shareholder_acctid = ['股东帐户', '股东账号', '股东代码']
+                    list_fields_exchange = ['市场', '市场代码', '交易市场', '交易板块', '板块', '交易所', '交易所名称', '交易市场',
+                                            'exchange_type']
+
+                    # 有优先级别的列表
+                    list_fields_longqty = [
+                        '股票余额', '拥股数量', '证券余额', '证券数量', '库存数量', '持仓数量', '参考持股', '持股数量', '当前持仓',
+                        '当前余额', '当前拥股', '实际数量', '实时余额', 'current_amount'
+                    ]
+                    dict_exchange2secidsrc = {'深A': 'SZSE', '沪A': 'SSE',
+                                              '深Ａ': 'SZSE', '沪Ａ': 'SSE',
+                                              '上海Ａ': 'SSE', '深圳Ａ': 'SZSE',
+                                              '00': 'SZSE', '10': 'SSE',
+                                              '0': 'SZSE', '1': 'SSE', '2': 'SZSE',
+                                              '上海Ａ股': 'SSE', '深圳Ａ股': 'SZSE',
+                                              '上海A股': 'SSE', '深圳A股': 'SZSE',
+                                              'SH': 'SSE', 'SZ': 'SZSE',
+                                              '上交所A': 'SSE', '深交所A': 'SZSE',
+                                              '上证所': 'SSE', '深交所': 'SZSE'}
+
+                    for dict_holding in list_dicts_holding:  # 不必 list_dicts_holding.keys()
+                        secid = None
+                        secidsrc = None
+                        symbol = None
+                        longqty = 0
+                        # shortqty = 0
+                        flag_check_new_name = True
+                        for field_secid in list_fields_secid:
+                            if field_secid in dict_holding:
+                                secid = str(dict_holding[field_secid])
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_holding)
+                            raise KeyError('unknown available_fund name')
+
+                        flag_check_new_name = True
+                        for field_shareholder_acctid in list_fields_shareholder_acctid:
+                            if field_shareholder_acctid in dict_holding:
+                                shareholder_acctid = str(dict_holding[field_shareholder_acctid])
+                                if shareholder_acctid[0].isalpha():
+                                    secidsrc = 'SSE'
+                                if shareholder_acctid[0].isdigit():
+                                    secidsrc = 'SZSE'
+                                flag_check_new_name = False
+
+                        for field_exchange in list_fields_exchange:
+                            if field_exchange in dict_holding:
+                                exchange = dict_holding[field_exchange]
+                                secidsrc = dict_exchange2secidsrc[exchange]
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_holding)
+                            raise KeyError('unknown security source name')
+
+                        flag_check_new_name = True
+                        for field_symbol in list_fields_symbol:
+                            if field_symbol in dict_holding:
+                                symbol = str(dict_holding[field_symbol])
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_holding)
+                            raise KeyError('unknown symbol name')
+
+                        flag_check_new_name = True
+                        for field_longqty in list_fields_longqty:
+                            if field_longqty in dict_holding:
+                                longqty = float(dict_holding[field_longqty])
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_holding)
+                            raise KeyError('unknown longqty name')
+
+                        windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
+                        windcode = secid + windcode_suffix
+                        sectype = self.get_sectype_from_code(windcode)
+
+                        dict_holding_fmtted = {
+                            'DataDate': self.str_day,
+                            'AcctIDByMXZ': acctidbymxz,
+                            'SecurityID': secid,
+                            'SecurityType': sectype,
+                            'Symbol': symbol,
+                            'SecurityIDSource': secidsrc,
+                            'LongQty': longqty,
+                            'ShortQty': 0,
+                            'LongAmt': None,
+                            'ShortAmt': 0,
+                            'NetAmt': None
+                        }
+                        list_dicts_holding_fmtted.append(dict_holding_fmtted)
+
+                    # 3.order
+                    list_dicts_order = list(self.db_posttrddata['manually_rawdata_order'].find(
+                        {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}
+                    ))
+                    # todo 新加了 ：hait_xtpb; huat_matic;gj_pluto 委托方向34什么鬼;
+                    #  zxjt_xtpb, zhaos_xtpb只有deal无order
+                    # todo 最好这些list变成 字典, 用DataSourceType去对应不易出现 '1'指代多个意思
+                    list_fields_cumqty = ['成交数量', 'business_amount']
+                    list_fields_side_c = ['买卖标记', 'entrust_bs', '委托方向']
+                    list_fields_side_m = ['买卖标记', 'trade_name', '委托方向']  # entrust_bs在matic_m里有，但是不详细
+                    list_fields_orderqty = ['委托量', 'entrust_amount', '委托数量']  # XXX_deal 会给不了委托量，委托日期，委托时间，只有成交
+                    list_fields_tradedate = ['委托日期', 'init_date']  # matic_m无entrust_date
+                    list_fields_transtime = ['委托时间', 'entrust_time']
+                    list_fields_avgpx = ['成交均价', 'business_price', '成交价格']  # 以后算balance用， exposure不用
+                    list_fields_sernum = []  # serialnumber以后用, orderID?
+                    # trade_plat 交易平台+entrust_no交易唯一化
+                    dict_fmtted_side_name_c = {'buy': ['1', '买入'],  # 担保品=券； 限价去掉,含"...“即可
+                                               'sell': ['2', '卖出']}
+                    dict_fmtted_side_name_m = {'buy': ['担保品买入', '1'],  # 担保品=券； 限价去掉,含"...“即可
+                                               'sell': ['担保品卖出', '2'], # 不会有的券商1指代sell吧？保险起见
+                                               # todo 最好这些list变成 字典, 用DataSourceType去对应
+                                               'sell short': ['融券卖出'],  # 限价 limit-price
+                                               'XQHQ': ['现券还券划拨', '34'],
+                                               'MQHQ': ['买券还券划拨'],
+                                               'cancel': ['撤单']}  # entrust_bs表方向时值为1，2
+                    list_date_format = ['%Y%m%d']
+                    list_time_format = ['%H%M%S', '%H:%M:%S']
+                    if accttype == 'c':
+                        dict_fmtted_side_name = dict_fmtted_side_name_c
+                        list_fields_side = list_fields_side_c
+                    else:
+                        dict_fmtted_side_name = dict_fmtted_side_name_m
+                        list_fields_side = list_fields_side_m
+
+                    for dict_order in list_dicts_order:
+                        secid = None
+                        secidsrc = None
+                        symbol = None
+                        cumqty = None
+                        side = None
+                        orderqty = None
+                        tradedate = None
+                        transtime = None
+                        avgpx = None
+                        flag_check_new_name = True
+                        for field_secid in list_fields_secid:
+                            if field_secid in dict_order:
+                                secid = str(dict_order[field_secid])
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_order)
+                            raise KeyError('unknown secid name')
+
+                        flag_check_new_name = True
+                        for field_shareholder_acctid in list_fields_shareholder_acctid:
+                            if field_shareholder_acctid in dict_order:
+                                shareholder_acctid = str(dict_order[field_shareholder_acctid])
+                                if shareholder_acctid[0].isalpha():
+                                    secidsrc = 'SSE'
+                                if shareholder_acctid[0].isdigit():
+                                    secidsrc = 'SZSE'
+                                flag_check_new_name = False
+
+                        for field_exchange in list_fields_exchange:
+                            if field_exchange in dict_order:
+                                exchange = dict_order[field_exchange]
+                                secidsrc = dict_exchange2secidsrc[exchange]
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_order)
+                            raise KeyError('unknown exchange name')
+
+                        flag_check_new_name = True
+                        for field_symbol in list_fields_symbol:
+                            if field_symbol in dict_order:
+                                symbol = str(dict_order[field_symbol])
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_order)
+                            raise KeyError('unknown symbol name')
+
+                        windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
+                        windcode = secid + windcode_suffix
+                        sectype = self.get_sectype_from_code(windcode)
+
+                        flag_check_new_name = True
+                        for field_cumqty in list_fields_cumqty:
+                            if field_cumqty in dict_order:
+                                cumqty = dict_order[field_cumqty]
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_order)
+                            raise KeyError('unknown cumqty name')
+
+                        flag_check_new_name = True
+                        for field_side in list_fields_side:
+                            if field_side in dict_order:
+                                side = dict_order[field_side]
+                                for key in dict_fmtted_side_name.keys():
+                                    for side_name in dict_fmtted_side_name[key]:
+                                        if side_name in side:  # ex: '担保品买入' in '限价担保品买入'
+                                            side = key  # standardization
+                                            flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_order)
+                            raise KeyError('unknown side name')
+
+                        flag_check_new_name = True
+                        for field_orderqty in list_fields_orderqty:
+                            if field_orderqty in dict_order:
+                                orderqty = dict_order[field_orderqty]
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            if dict_order['DataSourceType'] in ['zxjt_xtpb', 'zhaos_xtpb']:  # 他们给不了委托量
+                                pass
+                            else:
+                                print(dict_order)
+                                raise KeyError('unknown orderqty name')
+
+                        flag_check_new_name = True
+                        for field_tradedate in list_fields_tradedate:
+                            if field_tradedate in dict_order:
+                                tradedate = dict_order[field_tradedate]
+                                # 转化成统一时间格式
+                                datetime_obj = None
+                                for date_format in list_date_format:
+                                    try:
+                                        datetime_obj = datetime.datetime.strptime(tradedate, date_format)
+                                    except ValueError:
+                                        pass
+                                if datetime_obj:
+                                    tradedate = datetime_obj.strftime('%Y%m%d')  # 统一成 str_day格式
+                                else:
+                                    raise ValueError('Unrecognized trade date format')
+                                flag_check_new_name = False
+
+                        if flag_check_new_name:
+                            if dict_order['DataSourceType'] in ['zxjt_xtpb', 'zhaos_xtpb']:  # 他们给不了委托时间
+                                pass
+                            else:
+                                print(dict_order)
+                                raise KeyError('unknown tradedate name')
+
+                        flag_check_new_name = True
+                        for field_transtime in list_fields_transtime:
+                            if field_transtime in dict_order:
+                                transtime = dict_order[field_transtime]
+                                # 转化成统一时间格式
+                                datetime_obj = None
+                                for time_format in list_time_format:
+                                    try:
+                                        datetime_obj = datetime.datetime.strptime(transtime, time_format)
+                                    except ValueError:
+                                        pass
+                                if datetime_obj:
+                                    transtime = datetime_obj.strftime('%H:%M:%S')
+                                else:
+                                    raise ValueError('Unrecognized trade date format')
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            if dict_order['DataSourceType'] in ['zxjt_xtpb', 'zhaos_xtpb']:  # 他们给不了委托时间
+                                pass
+                            else:
+                                print(dict_order)
+                                raise KeyError('unknown transaction time name')
+
+                        flag_check_new_name = True
+                        for field_avgpx in list_fields_avgpx:
+                            if field_avgpx in dict_order:
+                                avgpx = dict_order[field_avgpx]
+                                flag_check_new_name = False
+                                if avgpx == 0:  # 撤单
+                                    cumqty = 0
+                        if flag_check_new_name:
+                            print(dict_order)
+                            raise KeyError('unknown average price name')
+
+                        dict_order_fmtted = {
+                            'DataDate': self.str_day,
+                            'AcctIDByMXZ': acctidbymxz,
+                            'SecurityID': secid,
+                            'SerialNumber': None,
+                            'SecurityType': sectype,
+                            'Symbol': symbol,
+                            'SecurityIDSource': secidsrc,
+                            'CumQty': cumqty,
+                            'Side': side,
+                            'OrdQty': orderqty,
+                            'TradeDate': tradedate,
+                            'TransactTime': transtime,
+                            'AvgPx': avgpx
+                        }
+
+                        list_dicts_order_fmtted.append(dict_order_fmtted)
+
+                    list_dicts_secloan = list(self.db_posttrddata['manually_rawdata_secloan'].find(
+                        {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day}
+                    ))
+                    # todo 加hait_xtpb; huat_matic参考其手册;
+                    #  pluto 合约类型，合约状态里的1和huat里的1指代一个吗？
+                    #  这块 有不少问题！！！目前只关注short暂不会出错
+                    list_fields_shortqty = ['未还合约数量', 'real_compact_amount', '未还负债数量']  # 未还合约数量一般是开仓数量
+                    # 合约和委托没有关系了，但是用contract还是compact(券商版）?
+                    list_fields_contractqty = ['合约开仓数量', 'business_amount', '成交数量']  # 国外sell short约为“融券卖出”
+                    list_fields_contracttype = ['合约类型', 'compact_type']  # 一定能分开 锁券与否
+                    list_fields_contractstatus = ['合约状态', 'compact_status']  # filled='完成'那不是委托？融资融券能用
+                    list_fields_opdate = ['合约开仓日期', 'open_date', '发生日期']  # FIX 合约: contract
+                    list_fields_sernum = []  # SerialNumber
+                    list_fields_compositesrc = []  # CompositeSource
+
+                    for dict_secloan in list_dicts_secloan:
+                        secid = None
+                        secidsrc = None
+                        symbol = None
+                        # longqty = 0
+                        shortqty = 0
+                        contractstatus = None
+                        contracttype = None
+                        contractqty = None
+                        opdate = None
+                        sernum = None
+                        compositesrc = None
+
+                        flag_check_new_name = True
+                        for field_secid in list_fields_secid:
+                            if field_secid in dict_secloan:
+                                secid = str(dict_secloan[field_secid])
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_secloan)
+                            raise KeyError('unknown field_secid name')
+
+                        flag_check_new_name = True
+                        for field_shareholder_acctid in list_fields_shareholder_acctid:
+                            if field_shareholder_acctid in dict_secloan:
+                                shareholder_acctid = str(dict_secloan[field_shareholder_acctid])
+                                if shareholder_acctid[0].isalpha():
+                                    secidsrc = 'SSE'
+                                if shareholder_acctid[0].isdigit():
+                                    secidsrc = 'SZSE'
+                                flag_check_new_name = False
+
+                        for field_exchange in list_fields_exchange:
+                            if field_exchange in dict_secloan:
+                                exchange = dict_secloan[field_exchange]
+                                secidsrc = dict_exchange2secidsrc[exchange]
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            if dict_secloan['DataSourceType'] in ['gtja_pluto']:  # 不给交易所
+                                # todo 加入security_id2src
+                                secidsrc = 'SSE'  # 510500.SH
+                            else:
+                                print(dict_secloan)
+                                raise KeyError('unknown field secidsrc name')
+
+                        flag_check_new_name = True
+                        for field_symbol in list_fields_symbol:
+                            if field_symbol in dict_secloan:
+                                symbol = str(dict_secloan[field_symbol])
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_secloan)
+                            raise KeyError('unknown field symbol name')
+
+                        flag_check_new_name = True
+                        for field_shortqty in list_fields_shortqty:
+                            if field_shortqty in dict_secloan:
+                                shortqty = float(dict_secloan[field_shortqty])
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_secloan)
+                            raise KeyError('unknown field shortqty name')
+
+                        flag_check_new_name = True
+                        for field_contractqty in list_fields_contractqty:
+                            if field_contractqty in dict_secloan:
+                                contractqty = str(dict_secloan[field_contractqty])
+                            flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_secloan)
+                            raise KeyError('unknown field contractqty name')
+
+                        flag_check_new_name = True
+                        for field_sernum in list_fields_sernum:
+                            if field_sernum in dict_secloan:
+                                sernum = str(dict_secloan[field_sernum])
+                                flag_check_new_name = False
+                        if flag_check_new_name and list_fields_sernum:
+                            print(dict_secloan)
+                            raise KeyError('unknown field serum name')
+
+                        flag_check_new_name = True
+                        for field_contractstatus in list_fields_contractstatus:
+                            if field_contractstatus in dict_secloan:
+                                contractstatus = str(dict_secloan[field_contractstatus])
+                                dict_contractstatus_fmt = {'部分归还': '部分归还', '未形成负债': None,
+                                                           '0': '开仓未归还', '1': '部分归还', '5': None,
+                                                           '2': '已归还/合约过期'}  # 有bug了...pluto vs matic
+                                # todo: 其它名字’开仓未归还‘等得之后补上
+                                contractstatus = dict_contractstatus_fmt[contractstatus]
+                                # if contractstatus is None:
+                                #     raise Exception('During Clearing, we can not have ambiguous status in the compact')
+                                flag_check_new_name = False
+
+                        if flag_check_new_name:
+                            print(dict_secloan)
+                            raise KeyError('unknown field_contractstatus name')
+
+                        flag_check_new_name = True
+                        for field_contracttype in list_fields_contracttype:
+                            if field_contracttype in dict_secloan:
+                                contracttype = str(dict_secloan[field_contracttype])
+                                dict_contracttype_fmt = {'融券': 'rq', '融资': 'rz',
+                                                         '1': 'rq', '0': 'rz',
+                                                         '2': '其它负债/？？？'}  # 一般没有融资, 其它负债（2）
+                                # 遇到bug，pluto vs matic 2指代不一样的
+                                # todo: 其它名字比如 私用融券（专项券池）得之后补上
+                                contractstatus = dict_contracttype_fmt[contracttype]
+                                flag_check_new_name = False
+                        if flag_check_new_name:
+                            print(dict_secloan)
+                            raise KeyError('unknown field_contracttype name')
+
+                        flag_check_new_name = True
+                        for field_opdate in list_fields_opdate:
+                            if field_opdate in dict_secloan:
+                                opdate = str(dict_secloan[field_opdate])
+                                flag_check_new_name = False
+                                datetime_obj = None
+                                # 和order共用 date格式
+                                for date_format in list_date_format:
+                                    try:
+                                        datetime_obj = datetime.datetime.strptime(opdate, date_format)
+                                    except ValueError:
+                                        pass
+                                if datetime_obj:
+                                    opdate = datetime_obj.strftime('%H:%M:%S')
+                                else:
+                                    raise ValueError('Unrecognized trade date format')
+
+                        if flag_check_new_name:
+                            print(dict_secloan)
+                            raise KeyError('unknown field opdate name')
+
+                        flag_check_new_name = True
+                        for field_compositesrc in list_fields_compositesrc:
+                            if field_compositesrc in dict_secloan:
+                                compositesrc = str(dict_secloan[field_compositesrc])
+                                flag_check_new_name = False
+                        if flag_check_new_name and list_fields_compositesrc:
+                            print(dict_secloan)
+                            raise KeyError('unknown field_compositesrc name')
+
+                        # print(secidsrc)
+                        windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
+                        windcode = secid + windcode_suffix
+                        sectype = self.get_sectype_from_code(windcode)
+
+                        dict_secloan_fmtted = {
+                            'DataDate': self.str_day,
+                            'AcctIDByMXZ': acctidbymxz,
+                            'SecurityID': secid,
+                            'SecurityType': sectype,
+                            'Symbol': symbol,
+                            'SecurityIDSource': secidsrc,
+                            'SerialNumber': sernum,
+                            'OpenPositionDate': opdate,  # = tradeDate？loan是交易吗？感觉FIX里是
+                            'ContractStatus': contractstatus,
+                            'ContractType': contracttype,
+                            'ContractQty': contractqty,
+                            'CompositeSource': compositesrc,
+                            'ShortQty': shortqty,
+                            'ShortAmt': None
+                        }
+                        list_dicts_secloan_fmtted.append(dict_secloan_fmtted)
+                elif accttype in ['f']:
+                    pass
+                else:
+                    raise ValueError('Unknown account type in basic account info.')
+            if list_dicts_fund_fmtted:
+                # 一天仅一个post！
+                self.db_posttrddata['fmtdata_fund'].delete_many({'DataDate': self.str_day})
+                self.db_posttrddata['fmtdata_fund'].insert_many(list_dicts_fund_fmtted)
+            if list_dicts_holding_fmtted:
+                self.db_posttrddata['fmtdata_holding'].delete_many({'DataDate': self.str_day})
+                self.db_posttrddata['fmtdata_holding'].insert_many(list_dicts_holding_fmtted)
+            if list_dicts_order_fmtted:
+                self.db_posttrddata['fmtdata_order'].delete_many({'DataDate': self.str_day})
+                self.db_posttrddata['fmtdata_order'].insert_many(list_dicts_order_fmtted)
+            if list_dicts_secloan_fmtted:
+                self.db_posttrddata['fmtdata_secloan'].delete_many({'DataDate': self.str_day})
+                self.db_posttrddata['fmtdata_secloan'].insert_many(list_dicts_secloan_fmtted)
+            print('Update fund and holding formatted by internal style finished.')
+        return
+
+    @run_every_30s
+    def update_position(self):
+
+        list_dicts_acctinfo = list(self.col_acctinfo.find({'DataDate': self.str_day, 'RptMark': 1}))
+        yesterday = (self.dt_day - datetime.timedelta(days=1)).strftime("%Y%m%d")
+        # print(yesterday)
+        list_dicts_position = []       # 取名改改...
+        list_windcode_used = []
+        for dict_acctinfo in list_dicts_acctinfo:
+
+            acctidbymxz = dict_acctinfo['AcctIDByMXZ']
+            # print('acctidbymxz', acctidbymxz)
+            accttype = dict_acctinfo['AcctType']
+            if accttype in ['c', 'm', 'o'] and (not self.clearing):
+                list_dicts_holding = list(self.db_trddata['fmtdata_holding'].find(
+                    {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'UpdateTime': {'$gte': self.record_fmt_time}}))
+                # print('1946',len(list_dicts_holding))
+                list_dicts_secloan = list(self.db_posttrddata['fmtdata_secloan'].find(
+                    {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'UpdateTime': {'$gte': self.record_fmt_time}}))
+                # print('1949',len(list_dicts_secloan))
+                for dict_holding in list_dicts_holding:
+                    secid = dict_holding['SecurityID']
+                    secidsrc = dict_holding['SecurityIDSource']
+                    symbol = dict_holding['Symbol']
+                    sectype = dict_holding['SecurityType']
+                    longqty_ref = dict_holding['LongQty']
+                    longqty = 0   # longqty可能准
+                    shortqty = 0
+                    # shortamt = 0
+
+                    windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
+                    windcode = secid + windcode_suffix
+                    list_windcode_used.append(windcode)
+
+                    post_holding = list(self.db_posttrddata['fmtdata_holding'].find(
+                       {'AcctIDByMXZ': acctidbymxz, 'DataDate': yesterday, 'SecurityID': secid, 'SecurityIDSource': secidsrc}))
+                    if len(post_holding) == 1:
+                        longqty = post_holding[0]['LongQty']
+                    elif len(post_holding) == 0:
+                        pass
+                    else:
+                        print('The postdata has wrong information', post_holding, len(post_holding))
+
+                    post_secloan = list(self.db_posttrddata['fmtdata_secloan'].find(
+                        {'AcctIDByMXZ': acctidbymxz, 'DataDate': yesterday, 'SecurityID': secid,
+                         'SecurityIDSource': secidsrc}))
+                    if len(post_secloan) == 1:
+                        shortqty = post_secloan[0]['ShortQty']
+                    elif len(post_secloan) == 0:
+                        pass
+                    else:
+                        print('The postdata has wrong information', post_holding, len(post_secloan))
+
+                    list_dicts_order = list(self.db_trddata['fmtdata_order'].find(
+                        {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'SecurityID': secid,
+                         'SecurityIDSource': secidsrc, 'UpdateTime': {'$gte': self.record_fmt_time}}))
+                    # print('1986', len(list_dicts_order))
+                    for dict_order in list_dicts_order:
+                        if dict_order['TradeDate'] == self.str_day:
+                            side = dict_order['Side']
+                            cumqty = float(dict_order['CumQty'])  # todo 为啥是str?
+                            if side == 'buy':
+                                longqty += cumqty
+                            if side == 'sell':
+                                longqty -= cumqty
+                            if side == 'sell short':
+                                shortqty += cumqty
+                            if side == 'XQHQ':
+                                longqty -= cumqty
+                                shortqty -= cumqty
+                            if side == 'MQHQ':
+                                shortqty -= cumqty
+                        else:
+                            continue
+
+                    if longqty < 0:  # 有的券商没有sell short说法
+                        if shortqty == 0:
+                            shortqty = - longqty
+                        else:
+                            raise Exception(f"LongQty is Negative: {shortqty}, {longqty}")
+                        longqty = 0
+
+                    # if abs(longqty - longqty_ref) > 0.01:
+                    #     print(dict_holding['_id'])
+                    #     raise Exception('The alogrithm to calculate longqty is somehow wrong!')
+
+                    dict_position = {
+                        'DataDate': self.str_day,
+                        'UpdateTime': None,
+                        'AcctIDByMXZ': acctidbymxz,
+                        'SecurityID': secid,
+                        'SecurityType': sectype,
+                        'Symbol': symbol,
+                        'SecurityIDSource': secidsrc,
+                        'LongQty': longqty,
+                        'ShortQty': shortqty,
+                        'LongAmt': None,
+                        'ShortAmt': None,
+                        'NetAmt': None,
+                        'WindCode': windcode
+                    }
+                    list_dicts_position.append(dict_position)
+
+                for dict_secloan in list_dicts_secloan:
+                    secid = dict_secloan['SecurityID']
+                    secidsrc = dict_secloan['SecurityIDSource']
+                    symbol = dict_secloan['Symbol']
+                    sectype = dict_secloan['SecurityType']
+                    windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
+                    windcode = secid + windcode_suffix
+                    list_windcode_used.append(windcode)
+                    if windcode in list_windcode_used:
+                        continue
+                    else:   # security without long position
+                        list_windcode_used.append(windcode)
+                        longqty_ref = 0  # if broker's holding is exact;
+                        longqty = 0
+                        shortqty = dict_secloan['ShortQty']
+                        post_holding = list(self.db_posttrddata['fmtdata_holding'].find(
+                            {'AcctIDByMXZ': acctidbymxz, 'DataDate': yesterday, 'SecurityID': secid,
+                             'SecurityIDSource': secidsrc}))
+                        if len(post_holding) == 1:
+                            longqty = post_holding[0]['LongQty']
+                        elif len(post_holding) == 0:
+                            pass
+                        else:
+                            print('The postdata has wrong information', post_holding, len(post_holding))
+                        list_dicts_order = list(self.db_trddata['fmtdata_order'].find(
+                            {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'SecurityID': secid,
+                             'SecurityIDSource': secidsrc, 'UpdateTime': {'$gte':  self.record_fmt_time}}))
+                        for dict_order in list_dicts_order:
+                            if dict_order['TradeDate'] == self.str_day:
+                                side = dict_order['Side']
+                                cumqty = float(dict_order['CumQty'])
+                                # 如果券商longqty准这些就要去掉
+                                if side == 'buy':
+                                    longqty += cumqty
+                                if side == 'sell':
+                                    longqty -= cumqty
+                                if side == 'sell short':
+                                    shortqty += cumqty
+                                if side == 'XQHQ':   # 会自相矛盾，因为既然long=0b不能现券还券
+                                    longqty -= cumqty
+                                    shortqty -= cumqty
+                                if side == 'MQHQ':
+                                    shortqty -= cumqty
+                            else:
+                                continue
+
+                        if longqty < 0:  # 有的券商没有sell short说法
+                            if shortqty == 0:
+                                shortqty = - longqty
+                            else:
+                                raise Exception(f"LongQty is Negative: {shortqty}, {longqty}")
+                            longqty = 0
+
+                        # if abs(longqty - longqty_ref) > 0.01:
+                        #     print(dict_secloan['_id'])
+                        #     raise Exception('The alogrithm to calculate longqty is somehow wrong!')
+
+                        dict_position = {
+                            'DataDate': self.str_day,
+                            'UpdateTime': None,
+                            'AcctIDByMXZ': acctidbymxz,
+                            'SecurityID': secid,
+                            'SecurityType': sectype,
+                            'Symbol': symbol,
+                            'SecurityIDSource': secidsrc,
+                            'LongQty': longqty,
+                            'ShortQty': shortqty,
+                            'LongAmt': None,
+                            'ShortAmt': None,
+                            'NetAmt': None,
+                            'WindCode': windcode
+                        }
+                        list_dicts_position.append(dict_position)
+
+                # holding 一个券最多一个，但order可以有多次
+                list_sec_ordered = list(self.db_trddata['fmtdata_order'].find({'AcctIDByMXZ': acctidbymxz,
+                                   'DataDate': self.str_day, 'UpdateTime': {'$gte': self.record_fmt_time}}))
+                for sec in list_sec_ordered:
+                    secid = sec['SecurityID']
+                    secidsrc = sec['SecurityIDSource']
+                    symbol = sec['Symbol']
+                    sectype = sec['SecurityType']
+                    windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
+                    windcode = secid + windcode_suffix
+                    list_windcode_used.append(windcode)
+                    if windcode in list_windcode_used:
+                        continue
+                    else:
+                        list_windcode_used.append(windcode)
+                        longqty_ref = 0  # if broker's holding is exact;
+                        longqty = 0
+                        shortqty = 0  # yesterday secloan has no data
+                        # 可能今日平仓
+                        post_holding = list(self.db_posttrddata['fmtdata_holding'].find(
+                            {'AcctIDByMXZ': acctidbymxz, 'DataDate': yesterday, 'SecurityID': secid,
+                             'SecurityIDSource': secidsrc}))
+                        if len(post_holding) == 1:
+                            longqty = post_holding[0]['LongQty']
+                        elif len(post_holding) == 0:
+                            pass
+                        else:
+                            print('The postdata has wrong information', post_holding, len(post_holding))
+                        list_dicts_order = list(self.db_trddata['fmtdata_order'].find(
+                            {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'SecurityID': secid,
+                             'SecurityIDSource': secidsrc, 'UpdateTime': {'$gte': self.record_fmt_time}}))
+                        for dict_order in list_dicts_order:
+                            if dict_order['TradeDate'] == self.str_day:
+                                side = dict_order['Side']
+                                cumqty = float(dict_order['CumQty'])
+                                # 如果券商longqty准这些就要去掉
+                                if side == 'buy':
+                                    longqty += cumqty
+                                if side == 'sell':
+                                    longqty -= cumqty
+                                if side == 'sell short':
+                                    shortqty += cumqty
+                                if side == 'XQHQ':   # 会自相矛盾，因为既然long=0b不能现券还券
+                                    raise ValueError('Contradictory Phenomenon')
+                                if side == 'MQHQ':
+                                    shortqty -= cumqty
+                            else:
+                                continue
+
+                        if longqty < 0:  # 有的券商没有sell short说法
+                            if shortqty == 0:
+                                shortqty = - longqty
+                            else:
+                                raise Exception(f"LongQty is Negative: {shortqty}, {longqty}")
+                            longqty = 0
+
+                        # if abs(longqty - longqty_ref) > 0.01:
+                        #     print(sec['_id'])
+                        #     raise Exception('The alogrithm to calculate longqty is somehow wrong!')
+
+                        dict_position = {
+                            'DataDate': self.str_day,
+                            'UpdateTime': None,
+                            'AcctIDByMXZ': acctidbymxz,
+                            'SecurityID': secid,
+                            'SecurityType': sectype,
+                            'Symbol': symbol,
+                            'SecurityIDSource': secidsrc,
+                            'LongQty': longqty,
+                            'ShortQty': shortqty,
+                            'LongAmt': None,
+                            'ShortAmt': None,
+                            'NetAmt': None,
+                            'WindCode': windcode
+                        }
+                        list_dicts_position.append(dict_position)
+                    # 按acctidbymxz exposure数据
+            elif accttype in ['f'] and (not self.clearing):
+                list_dicts_holding_future = list(self.db_trddata['future_api_holding'].find(
+                        {'DataDate': self.str_day, 'AcctIDByMXZ': acctidbymxz})) # , 'UpdateTime': self.record_update_raw_time
                 # list_dicts_holding_future_exposure_draft = []
                 for dict_holding_future in list_dicts_holding_future:
                     secid = dict_holding_future['instrument_id']
@@ -1122,115 +2177,137 @@ class ExposMonit:
                     secidsrc = dict_holding_future['exchange']
                     dict_future2spot_windcode = {'IC': '000905.SH', 'IH': '000016.SH', 'IF': '000300.SH'}
                     windcode = dict_future2spot_windcode[secid_first_part]
-                    close = self.dict_wcode2close[windcode]  # spot close
+                    list_windcode_used.append(windcode)
+
                     qty = dict_holding_future['position']
                     direction = dict_holding_future['direction']
-                    future_long_qty = 0
-                    future_short_qty = 0
-                    future_long_amt = 0
-                    future_short_amt = 0
+                    future_longqty = 0
+                    future_shortqty = 0
 
                     if direction == 'buy':
-                        future_long_qty = qty
-                        future_long_amt = close * future_long_qty * self.dict_future2multiplier[secid_first_part]
+                        future_longqty = qty
+                        # future_longamt = close * future_longqty * self.dict_future2multiplier[secid_first_part]
                     elif direction == 'sell':
-                        future_short_qty = qty
-                        future_short_amt = close * future_short_qty * self.dict_future2multiplier[secid_first_part]
+                        future_shortqty = qty
+                        # future_shortamt = close * future_shortqty * self.dict_future2multiplier[secid_first_part]
                     else:
                         raise ValueError('Unknown direction in future respond.')
-                    # future_net_qty = future_long_qty - future_short_qty
-                    future_net_amt = future_long_amt - future_short_amt
-                    dict_future_position_fmtted= {
+
+                    dict_position = {
                         'DataDate': self.str_day,
+                        'UpdateTime': None,
                         'AcctIDByMXZ': acctidbymxz,
                         'SecurityID': secid,
-                        'SecurityType': 'Index Future',
+                        'SecurityType': 'Index Future',  # todo 用函数获取类型
                         'Symbol': None,
                         'SecurityIDSource': secidsrc,
-                        'LongQty': future_long_qty,
-                        'ShortQty': future_short_qty,
-                        'LongAmt': future_long_amt,
-                        'ShortAmt': future_short_amt,   # to calculate after we have last price
-                        'NetAmt': future_net_amt,
-                        'CashFromShortSelling': 0   # 要算卖出赚的钱？
+                        'LongQty': future_longqty,
+                        'ShortQty': future_shortqty,
+                        'LongAmt': None,
+                        'ShortAmt': None,
+                        'NetAmt': None,
+                        'WindCode': windcode
                     }
-                    list_dicts_future_position_fmtted.append(dict_future_position_fmtted)
-                    #     list_dicts_holding_future_exposure_draft.append(dict_holding_future_exposure_draft)
-                    # if list_dicts_holding_future_exposure_draft:
-                    #     """一个账户的全部品种风险暴露（对IC提供的还是IH提供的未作区分）"""
-                    #     df_holding_future_exposure_draft = pd.DataFrame(list_dicts_holding_future_exposure_draft)
-                    #     exposure_long_amt = float(df_holding_future_exposure_draft['LongAmt'].sum())
-                    #     exposure_short_amt = float(df_holding_future_exposure_draft['ShortAmt'].sum())
-                    #     exposure_net_amt = exposure_long_amt - exposure_short_amt
-                    # else:
-                    #     exposure_long_amt = 0
-                    #     exposure_short_amt = 0
-                    #     exposure_net_amt = 0
-                list_dicts_captial_future = list(self.db_trddata['future_api_capital'].find(
-                            {'DataDate': self.str_day, 'AcctIDByMXZ': acctidbymxz}
-                        )
-                    )
-                for dict_capital_future in list_dicts_captial_future:
-                    approximate_na = dict_capital_future['DYNAMICBALANCE']
-                    cash_balance = dict_capital_future['STATICBALANCE']
-                    acctidbymxz = dict_capital_future['AcctIDByMXZ']
-                    dict_future_capital_fmtted = {
-                        'DataDate': self.str_day,
-                        'AcctIDByMXZ': acctidbymxz,
-                        'CashBalance': cash_balance,
-                        'AvailableFund': approximate_na,  # flt_approximate_na?
-                        'TotalAsset': None,
-                        'TotalMarketValue': None  # 总股本*每股价值 = 证券市值
-                    }
-                    list_dicts_future_captial_fmtted.append(dict_future_capital_fmtted)
+                    list_dicts_position.append(dict_position)
 
+        # 统一一次询问现价，节约时间，市价更加精确
+        self.record_position_query_time = datetime.datetime.today().strftime("%H:%M:%S")
+        # self.record_wind_query_time = (datetime.datetime.today() - datetime.timedelta(hours=1, seconds=10)).strftime("%H:%M:%S")
+        # print('2233', len(list_windcode_used))
+        dict_windcode2last = self.get_order_last_from_wind(list_windcode_used)
+        # print('2230 get last finished')
+        # print(dict_windcode2last)
+        for dict_position in list_dicts_position:
+            windcode = dict_position['WindCode']
+            if dict_position['SecurityType'] == 'Index Future':
+                secid_first_part = dict_position['SecurityID'][:-4]
+                point = self.dict_future2multiplier[secid_first_part]
+                dict_position['LongAmt'] = dict_position['LongQty'] * dict_windcode2last[windcode] * point
+                dict_position['ShortAmt'] = dict_position['ShortQty'] * dict_windcode2last[windcode] * point
             else:
-                raise ValueError('Unknown account type in basic account info.')
-        # dict_exposure_analysis = {
-        #     'DataDate': self.str_day,
-        #     'AcctIDByMXZ': acctidbymxz,
-        #     'PrdCode': prdcode,
-        #     'LongExposure': exposure_long_amt,
-        #     'ShortExposure': exposure_short_amt,
-        #     'NetExposure': exposure_net_amt,
-        #     'ApproximateNetAsset': flt_approximate_na,
-        # }
-        # self.db_trddata['exposure_analysis_by_acctidbymxz'].delete_many({'DataDate': self.str_day,
-        #                                                                  'AcctIDByMXZ': acctidbymxz})
-        # if dict_exposure_analysis:
-        #     self.db_trddata['exposure_analysis_by_acctidbymxz'].insert_one(dict_exposure_analysis)
-        self.db_trddata['fmtdata_capital'].insert_many(list_dicts_capital_fmtted)
-        self.db_trddata['fmtdata_secliability'].insert_many(list_dicts_secliability_fmtted)
-        self.db_trddata['fmtdata_holding'].insert_many(list_dicts_holding_fmtted)
+                dict_position['LongAmt'] = dict_position['LongQty'] * dict_windcode2last[windcode]
+                dict_position['ShortAmt'] = dict_position['ShortQty'] * dict_windcode2last[windcode]
+            dict_position['NetAmt'] = dict_position['LongAmt'] - dict_position['ShortAmt']
+            dict_position['UpdateTime'] = self.record_position_query_time
+            # print('2246', dict_position)
+            # del dict_position['WindCode'] # 可删可不删
 
-        self.db_trddata['fmtdata_position'].insert_many(list_dicts_holding_fmtted)
-        self.db_trddata['fmtdata_capital'].insert_many(list_dicts_future_captial_fmtted)
-        print('Update capital and holding formatted by internal style finished.')
+        # print(list_dicts_position)
+        if list_dicts_position:
+            self.db_trddata['position'].delete_many({'DataDate': self.str_day, 'UpdateTime': self.record_position_query_time})
+            self.db_trddata['position'].insert_many(list_dicts_position)
+        self.record_fmt_time = None     # 让他下一个循环也等待fmt跑1秒
+        # print("Update Position finished")
         return
 
+    @run_every_30s
     def exposure_analysis(self):
 
-        return
+        list_dicts_acctidbymxz = self.col_acctinfo.find({'DataDate': self.str_day, 'RptMark': 1},
+                                                       {'_id': 0, 'AcctIDByMXZ': 1})
+        list_acctidbymxz = []
+        for _ in list_dicts_acctidbymxz:
+            list_acctidbymxz.append(_['AcctIDByMXZ'])
+        dict_index = {'LongQty': 1, 'ShortQty': 1, 'LongAmt': 1, 'ShortAmt': 1, 'NetAmt': 1}
+        exposure_df = pd.DataFrame(columns=list_acctidbymxz, index=dict_index)
+        exposure_df = exposure_df.fillna(0)
+        dict_index.update({'_id': 0})
+        for acctidbymxz in list_acctidbymxz:
+            list_dicts_position = list(self.db_trddata['position'].find(
+            {'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'UpdateTime': {'$gte': self.record_position_query_time}}, dict_index))
+            # 加上 updatetime
+            for position in list_dicts_position:
+                exposure_df[acctidbymxz] += list(position.values())  #
+                # print(exposure_df.loc[acctidbymxz, :])
+
+        exposure_docs = []
+        for index, row in exposure_df.T.iterrows():
+            doc = dict(row)
+            doc.update({'AcctIDByMXZ': index, 'DataDate': self.str_day, 'UpdateTime': self.record_position_query_time})
+            exposure_docs.append(doc)
+        if exposure_docs:
+            print(exposure_docs)
+            self.db_trddata['exposure'].delete_many({'DataDate': self.str_day, 'UpdateTime': self.record_position_query_time})
+            self.db_trddata['exposure'].insert_many(exposure_docs)
+        self.record_position_query_time = None
+        # print("Exposure Analysis Finished")
+        return exposure_df   # 可视化... + 时间：self.record_position_query_time
 
     def run(self):
-        update_raw_thread = threading.Thread(target=self.update_rawdata, args=())
-        update_future_thread = threading.Thread(target=self.update_trddata_f)
-        # 分先后顺序
-        update_raw_thread.start()
-        update_future_thread.start()
+        if self.clearing:
+            # self.update_all_rawdata()
+            self.update_fmtpostdata()
+            # 清算只跑一次，不用一直跑
+        else:
+            update_updateraw_thread = threading.Thread(target=self.update_all_rawdata, args=())
+            update_future_thread = threading.Thread(target=self.update_trddata_f)
+            update_fmtted_thread = threading.Thread(target=self.update_fmtdata)
 
-        while True:
-            command = input("输入命令 pause/run/stop 控制进程, 按Enter再次换出：")
-            if command == "run":
-                print('Calling functions...')
-                self.resume()
+            update_position_thread = threading.Thread(target=self.update_position)
+            exposure_monitoring_thread = threading.Thread(target=self.exposure_analysis)
+            # 分先后顺序
+            # todo 有时候post会在其他前先触发，mongoDB可以写入，但是读出数据是“老版”数据，如何不影响多线程调？
+            # update_updateraw_thread.start()
+            update_future_thread.start()
+            self.record_update_raw_time = '14:00:00'
+            # self.record_position_query_time = '11:12:34'
+            update_fmtted_thread.start()
+            # wait....some seconds?
+            update_position_thread.start()
+            exposure_monitoring_thread.start()
+            # 多线程写入是否会“调用旧的应该被覆盖的”数据
+            while True:
+                command = input("输入命令 pause/run/stop 控制进程, 按Enter再次换出：")
+                if command == "run":
+                    print('Calling functions...')
+                    self.resume()
 
-            elif command == "pause":
-                self.pause()
+                elif command == "pause":
+                    self.pause()
 
-            elif command == "stop":
-                self.running = False
-                break
+                elif command == "stop":
+                    self.running = False
+                    break
         print('Program stopped!')
 
     def pause(self):
