@@ -1,7 +1,14 @@
 """
-todo list 12.15
-2. cash里字段在position处理时生成
-3. position: order + loan + last算出short，结合holding合成
+todo list 12.24
+0. 获得真实post-trade数据 - 校验算法
+1. 线程分开：先后考虑！防止一个错了全烂掉： 读取；标准化；运算；监控
+分成三个class/三个文件：线程/进程； post-trade，read_raw, fmt 一整个线程一直跑（公司电脑）
+7. 配置阿里云； 等万得能用再用
+3. 添加新功能： ID->source+type; 券商买券还券等区分标识； 直接从券商处下载？ read_raw时间判定
+4. 初步封装，相似函数抽象化，所有变量“较短地”写在input里； 给添加新变量留出“裕量”！
+2. flask
+6. patch场外
+5. 资金 - exposure比例，相对exposure； 策略相关...
 """
 import pandas as pd
 import pymongo
@@ -16,7 +23,8 @@ import time
 import functools
 import warnings
 
-# global functions and objects
+# global functions and objects (名字取好，唯一
+# 引用全局变量，不用global声明，修改全局变量，需要使用global声明，特别地，列表、字典等如果只是修改其中元素的值，可以直接使用全局变量，不需要global声明
 
 
 def run_every_30s(func):
@@ -45,14 +53,22 @@ def run_every_30s(func):
                     func(self, *args, **kwargs)
                     self.lock.release()
                     print('Function: ', func.__name__, 'finished')
-                    time.sleep(30)
+                    time.sleep(180)
                     if func.__name__ == 'update_fmtdata':
-                        self.record_update_raw_time = '16:00:00'
+                        # self.record_update_raw_time = '16:00:00'
+                        self.record_fmt_time = '14:37:00'
                         print('start again')
                     # print('I am awaken!')
 
     return wrapper
 
+class ReadRaw:
+    def __init__(self):
+        return
+
+class FmtData:
+    def __init__(self):
+        return
 
 class ExposMonit:
     def __init__(self):
@@ -65,7 +81,9 @@ class ExposMonit:
         """
         w.start()
 
-        self.dt_day = datetime.datetime(2020, 12, 18, 10, 0, 0)    # datetime.datetime.today() - datetime.timedelta(days=3)
+        # 时间判定：交易时间；清算时间；发呆时间讨论
+
+        self.dt_day = datetime.datetime.today() - datetime.timedelta(2)  # datetime.datetime(2020, 12, 18, 10, 0, 0)
         self.str_day = self.dt_day.strftime('%Y%m%d')
         end_clearing = datetime.datetime.strptime(f"{self.str_day} 08:30:00", "%Y%m%d %H:%M:%S")  # 今早清算结束
         start_clearing = datetime.datetime.strptime(f"{self.str_day} 21:30:00", "%Y%m%d %H:%M:%S")  # 今晚清算开始
@@ -74,7 +92,12 @@ class ExposMonit:
         self.client_mongo = pymongo.MongoClient(port=27017, host='localhost',
                                                 username='admin', password='123456')
 
-        self.db_posttrddata = self.client_mongo['posttrddata']
+        client_post = pymongo.MongoClient(host='localhost', port=27019)
+        self.db_posttrddata = client_post['post_trade_data']
+        self.post_holding_name = 'post_trade_fmtdata_holding'
+        self.post_secloan_name = 'post_trade_fmtdata_shortqty_from_secloan'
+        # self.db_posttrddata = self.client_mongo['posttrddata']
+
         self.db_trddata = self.client_mongo['trddata']
         self.db_basicinfo = self.client_mongo['basicinfo']
         self.col_acctinfo = self.db_basicinfo['acctinfo']
@@ -1952,14 +1975,27 @@ class ExposMonit:
                     dict_pair2allcol[pair][col_name].append(all_doc)
                 except KeyError:  # one key doesn't exist.
                     dict_pair2allcol.update({pair: {col_name: [all_doc]}})
-        for col_name in ['fmtdata_holding', 'fmtdata_secloan']:
+        # post_col_name = ['fmtdata_holding', 'fmtdata_secloan']
+        for col_name in [self.post_holding_name, self.post_secloan_name]:
             list_to_add = list(self.db_posttrddata[col_name].find({'DataDate': yesterday}))
             for _ in list_to_add:
+                if not ('SecurityType' in _):  # 老版post里无IDSource...
+                    if not 'SecurityIDSource' in _:
+                        _['SecurityIDSource'] = 'SZSE'  # 猜一猜...
+                    windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[_['SecurityIDSource']]
+                    try:
+                        _['SecurityType'] = self.get_sectype_from_code(_['SecurityID'] + windcode_suffix)
+                        if _['SecurityType'] == 'IrrelevantItem':
+                            _['SecurityIDSource'] = 'SSE'
+                            _['SecurityType'] = self.get_sectype_from_code(_['SecurityID'] + '.SH')
+                    except ValueError:
+                        _['SecurityIDSource'] = 'SSE'
+                        _['SecurityType'] = self.get_sectype_from_code(_['SecurityID'] + '.SH')
                 pair = (_['AcctIDByMXZ'], _['SecurityID'], _['SecurityIDSource'],
-                            _['SecurityType'], _['Symbol'])
+                        _['SecurityType'], _['Symbol'])
                 # set_pair_secid = set_pair_secid | {pair}  # 并集
                 all_doc = _.copy()
-                col_name_ = 'post_' + col_name
+                col_name_ = col_name   # 'post_' + col_name
                 try:
                     dict_pair2allcol[pair][col_name_].append(all_doc)
                 except KeyError:  # one key doesn't exist.
@@ -1969,17 +2005,19 @@ class ExposMonit:
             acctidbymxz = pair[0]
             secid = pair[1]
             secidsrc = pair[2]
+            sectype = None
+            symbol = None
             accttype = dict_id2type[acctidbymxz]
             try:
                 list_dicts_holding = dict_pair2allcol[pair]['fmtdata_holding']
             except KeyError:  # pair may not has 'fmtdata_holding' etc key
                 list_dicts_holding = []
             try:
-                list_dicts_post_holding = dict_pair2allcol[pair]['post_fmtdata_holding']
+                list_dicts_post_holding = dict_pair2allcol[pair][self.post_holding_name]
             except KeyError:  # pair may not has 'fmtdata_holding' etc key
                 list_dicts_post_holding = []
             try:
-                list_dicts_secloan = dict_pair2allcol[pair]['post_fmtdata_secloan']
+                list_dicts_secloan = dict_pair2allcol[pair][self.post_secloan_name]
             except KeyError:  # pair may not has 'fmtdata_holding' etc key
                 list_dicts_secloan = []
             try:
@@ -1992,24 +2030,27 @@ class ExposMonit:
                 list_dicts_holding_future = []
 
             if accttype in ['c', 'm', 'o'] and (not self.clearing):
-                symbol = pair[3]
-                sectype = pair[4]
+                if len(pair) == 5:
+                    symbol = pair[3]
+                    sectype = pair[4]
                 windcode_suffix = {'SZSE': '.SZ', 'SSE': '.SH'}[secidsrc]
                 windcode = secid + windcode_suffix
 
                 longqty = 0  # longqty可能准
                 longqty_ref = 0
                 shortqty = 0
-                dict_holding_id = 'no reference holding'
-                dict_secloan_id = 'no reference holding'
+                dict_holding_id = 'no reference'
+                dict_secloan_id = 'no reference'
+                dict_post_holding_id = 'no reference'
 
                 if len(list_dicts_post_holding) == 1:
                     longqty = list_dicts_post_holding[0]['LongQty']
+                    dict_post_holding_id = list_dicts_post_holding[0]['_id']
                 elif len(list_dicts_post_holding) == 0:
                     pass
                 else:
-
                     tmax = time.strptime('0:0:0', '%H:%M:%S')
+                    post_holding_id = list_dicts_post_holding[0]['_id']
                     for d in list_dicts_post_holding:
                         t = time.strptime(d['UpdateTime'], '%H:%M:%S')
                         if tmax < t:
@@ -2020,7 +2061,7 @@ class ExposMonit:
 
                 if len(list_dicts_holding) == 1:
                     longqty_ref = list_dicts_holding[0]['LongQty']
-                    dict_holding_id = list_dicts_post_holding[0]['_id']
+                    dict_holding_id = list_dicts_holding[0]['_id']
                 elif len(list_dicts_holding) == 0:
                     pass
                 else:
@@ -2032,20 +2073,9 @@ class ExposMonit:
                             dict_holding_id = d['_id']
                             tmax = t
 
-                if len(list_dicts_secloan) == 1:
-                    shortqty = list_dicts_secloan[0]['ShortQty']
-                    dict_secloan_id = list_dicts_secloan[0]['_id']
-                elif len(list_dicts_secloan) == 0:
-                    pass
-                else:
-                    tmax = time.strptime('0:0:0', '%H:%M:%S')
-                    for d in list_dicts_holding:
-                        t = time.strptime(d['UpdateTime'], '%H:%M:%S')
-                        if tmax < t:
-                            shortqty = d['ShortQty']
-                            dict_secloan_id = d['_id']
-                            tmax = t
-                    print('The secloan has too many information', dict_secloan_id)
+                if len(list_dicts_secloan) > 0:
+                    for d in list_dicts_secloan:
+                        shortqty += d['ShortQty']  # 可能多个合约
 
                 for dict_order in list_dicts_order:
                     if self.str_day == dict_order['TradeDate']:
@@ -2068,14 +2098,15 @@ class ExposMonit:
                     if longqty < 0:  # 有的券商没有sell short说法
                         if shortqty == 0:
                             shortqty = - longqty
-                        elif abs(shortqty+longqty) < 0.01:  # 因为short仅仅来自postdata
-                            warnings.warn(f"LongQty is Negative: short: {shortqty}, long: {longqty}  because "
-                                          f"postdata is not clean, id {dict_secloan_id}")
+                        elif abs(shortqty+longqty) > 0.01:  # 因为short仅仅来自postdata
+                            warnings.warn("LongQty is Negative: short: %f, long: %f because "
+                                          "postdata is not clean, id %s" % (shortqty, longqty, dict_secloan_id))
                         longqty = 0
 
                 if abs(longqty - longqty_ref) > 0.01:
-                    warnings.warn(f"Please check fmtdata_holding:{dict_holding_id}, "
-                                  f"The alogrithm to calculate longqty is somehow wrong!")
+                    warnings.warn("Please check fmtdata_holding: %s and the one in posttrade %s and order: %s "
+                                  " The alogrithm to calculate longqty is somehow wrong!"
+                                  % (dict_holding_id, dict_post_holding_id, secid))
 
                 # 只监控有票子的
                 if longqty != 0 or shortqty != 0:
@@ -2167,7 +2198,7 @@ class ExposMonit:
 
     @run_every_30s
     def exposure_analysis(self):
-        # todo 按照产品汇总， 策略字段留出来
+        # todo 按照产品汇总， 策略字段留出来， 相对敞口： amt/资金
         list_dicts_acctidbymxz = self.db_trddata['position'].find({'DataDate': self.str_day, 'UpdateTime':{'$gte': self.record_position_query_time}})
         set_acctidbymxz = set()
         for _ in list_dicts_acctidbymxz:
@@ -2215,9 +2246,10 @@ class ExposMonit:
             # todo 有时候post会在其他前先触发，mongoDB可以写入，但是读出数据是“老版”数据，如何不影响多线程调？
             # update_updateraw_thread.start()
             # update_future_thread.start()
-            self.record_update_raw_time = '16:00:00'
+            # self.record_update_raw_time = '16:00:00'
+            self.record_fmt_time = '14:37:00'
             # self.record_position_query_time = '11:12:34'
-            update_fmtted_thread.start()
+            # update_fmtted_thread.start()
             # wait....some seconds?
             update_position_thread.start()
             exposure_monitoring_thread.start()
