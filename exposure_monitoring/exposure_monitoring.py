@@ -31,13 +31,11 @@ import schedule
 # 修改全局变量，需要使用global声明，但列表、字典等如果只是修改其中元素的值，可以直接使用，不需要global声明
 
 # 全局变量存到数据库里， "global"数据库独立于其它所有项目，元数据
-client_local_main = pymongo.MongoClient(port=27017, host='localhost',
-                                        username='admin', password='123456')
 client_remote_main = pymongo.MongoClient(port=27017, host='192.168.22.41',
                                          username='admin', password='123456')
-client_local_test_data = pymongo.MongoClient(port=27018, host='localhost')
 col_global_var = client_remote_main['global_var']['exposure_monitoring']
 dt_test_day = None  # datetime.datetime(2020, 12, 30, 10,0,0)
+is_trading_day = True   # 交易日人判断
 
 
 # 最好放到某个Utils里
@@ -50,9 +48,8 @@ def ini_time_records():
     list_dict_time = list(col_global_var.find({'DataDate': str_date}))
     end_clearing = datetime.datetime.strptime(f"{str_date} 08:30:00", "%Y%m%d %H:%M:%S")  # 今早清算结束
     start_clearing = datetime.datetime.strptime(f"{str_date} 21:30:00", "%Y%m%d %H:%M:%S")  # 今晚清算开始
-    is_trading_day = (datetime_today.weekday() in [0, 1, 2, 3, 4])  # 周一=0
     is_trading_time = (start_clearing > datetime_today > end_clearing)
-    raw_time, fmt_time, position_time = (None, None, None)
+    raw_time, fmt_time, position_time = (None, '17:48:45', None)
     dict_time = {'IsTradeDay': is_trading_day, 'IsTradeTime': is_trading_time,
                  'RawUpdateTime': raw_time, 'FmtUpdateTime': fmt_time, 'PositionUpdateTime': position_time}
     if len(list_dict_time) == 0:
@@ -115,7 +112,8 @@ def runtime_threading(func):
                     print('Function: ', func.__name__, 'finished, go to sleep')
                     time.sleep(60*60*6)     # 7200 睡2小时
             else:
-                time.sleep(60*60*6)  # 睡6小时
+                time.sleep(60*60*6)
+                raise ValueError('今天不是交易日')     # 睡6小时
     return wrapper
 
 
@@ -924,7 +922,7 @@ class FmtData:       # 包含post
                                        'sell': ['担保品卖出', '2'],
                                        'sell short': ['融券卖出'],  # 限价 limit-price
                                        'XQHQ': ['现券还券划拨', '34'],
-                                       'MQHQ': ['买券还券划拨','买券还券'],
+                                       'MQHQ': ['买券还券划拨', '买券还券'],
                                        'cancel': ['撤单']}  # entrust_bs表方向时值为1，2
             list_date_format = ['%Y%m%d']
             list_time_format = ['%H%M%S', '%H:%M:%S']
@@ -1492,7 +1490,7 @@ class FmtData:       # 包含post
                     target_collection = dict_mark2fmt_col[str_f_h_o_s_mark]
                     list_dicts_fmtted = self.formulate_raw_data(acctidbymxz, accttype, str_f_h_o_s_mark, mongo_collection)
                     if list_dicts_fmtted:
-                        target_collection.delete_many({'DataDate': self.str_day, 'UpdateTime': self.record_fmt_time})
+                        target_collection.delete_many({'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'UpdateTime': self.record_fmt_time})
                         target_collection.insert_many(list_dicts_fmtted)
             else:
                 if accttype == 'f':
@@ -1509,7 +1507,7 @@ class FmtData:       # 包含post
                     target_collection = dict_mark2fmt_col[str_f_h_o_s_mark]
                     list_dicts_fmtted = self.formulate_raw_data(acctidbymxz, accttype, str_f_h_o_s_mark, mongo_collection)
                     if list_dicts_fmtted:
-                        target_collection.delete_many({'DataDate': self.str_day, 'UpdateTime': self.record_fmt_time})
+                        target_collection.delete_many({'AcctIDByMXZ': acctidbymxz, 'DataDate': self.str_day, 'UpdateTime': self.record_fmt_time})
                         target_collection.insert_many(list_dicts_fmtted)
         col_global_var.update_one({'DataDate': self.str_day}, {'$set': {'RawUpdateTime': None}})
         col_global_var.update_one({'DataDate': self.str_day}, {'$set': {'FmtUpdateTime': self.record_fmt_time}})
@@ -1629,7 +1627,10 @@ class Position:
             secidsrc = pair[2]
             sectype = None
             symbol = None
-            accttype = dict_id2type[acctidbymxz]
+            try:    # RptMark != 1, 不读了
+                accttype = dict_id2type[acctidbymxz]
+            except KeyError:
+                continue
             try:
                 list_dicts_holding = dict_pair2allcol[pair]['trade_fmtdata_holding']
             except KeyError:  # pair may not has 'fmtdata_holding' etc key
@@ -1700,35 +1701,36 @@ class Position:
                         shortqty += d['ShortQty']  # 可能多个合约
 
                 for dict_order in list_dicts_order:
-                    if self.str_day == dict_order['TradeDate']:
-                        side = dict_order['Side']
-                        cumqty = float(dict_order['CumQty'])  # todo 为啥是str?
-                        if side == 'buy':
-                            longqty += cumqty
-                        if side == 'sell':
-                            longqty -= cumqty
-                        if side == 'sell short':
-                            shortqty += cumqty
-                        if side == 'XQHQ':
-                            longqty -= cumqty
-                            shortqty -= cumqty
-                        if side == 'MQHQ':
-                            shortqty -= cumqty
+                    # if self.str_day == dict_order['TradeDate']:
+                    side = dict_order['Side']
+                    cumqty = float(dict_order['CumQty'])  # todo 为啥是str?
+                    if side == 'buy':
+                        longqty += cumqty
+                    if side == 'sell':
+                        longqty -= cumqty
+                    if side == 'sell short':
+                        shortqty += cumqty
+                    if side == 'XQHQ':
+                        longqty -= cumqty
+                        shortqty -= cumqty
+                    if side == 'MQHQ':
+                        shortqty -= cumqty
                     else:
                         continue
 
-                    if longqty < 0:  # 有的券商没有sell short说法, long就是net..
-                        shortqty = - longqty
-                        if abs(shortqty + longqty) > 0.01:  # 因为short仅仅来自postdata
-                            warnings.warn("LongQty is Negative: short: %f, long: %f because "
-                                          "postdata is not clean, id %s" % (shortqty, longqty, dict_secloan_id))
+                if longqty < 0:  # 有的券商没有sell short说法, long就是net..
+                    if abs(shortqty + longqty) > 0.01:  # 因为short仅仅来自postdata
+                        warnings.warn("LongQty is Negative: short: %f, long: %f because "
+                                      "postdata is not clean, id %s" % (shortqty, longqty, dict_secloan_id))
                         longqty = 0
+                    # todo long小于0各种情况讨论。。c用户； m时有short， 无short
 
                 if abs(longqty - longqty_ref) > 0.01:
                     warnings.warn("\n"
                                   "Please check fmtdata_holding: %s and the one in posttrade %s and order: %s \n"
-                                  " The alogrithm to calculate longqty of account: %s is somehow wrong!"
-                                  % (dict_holding_id, dict_post_holding_id, secid, acctidbymxz))
+                                  " The alogrithm to calculate longqty of account: %s is somehow wrong! \n"
+                                  " longqty: %d; shortqty: %d; longqty_ref: %d"
+                                  % (dict_holding_id, dict_post_holding_id, secid, acctidbymxz, longqty, shortqty, longqty_ref))
                     longqty = longqty_ref
                 # todo 在做一个short_ref现在的票子...
 
@@ -1925,7 +1927,6 @@ if __name__ == '__main__':
     # fmt_data = FmtData()
     #
     # read_raw.run()
-    # # record_update_raw_time = "13:00:00"
     # fmt_data.run()
     is_trading_time = ini_time_records()[3]
     if is_trading_time:
