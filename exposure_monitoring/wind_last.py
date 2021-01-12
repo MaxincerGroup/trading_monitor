@@ -4,8 +4,7 @@ import pymongo
 import datetime
 import time
 
-mongo_client = pymongo.MongoClient(host='localhost', port=27017,
-                                   username='admin', password='123456')
+mongo_client = pymongo.MongoClient(host='192.168.2.2', port=27017)
 
 
 class WindLast:
