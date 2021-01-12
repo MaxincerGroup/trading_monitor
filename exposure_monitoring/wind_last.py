@@ -49,3 +49,8 @@ class WindLast:
     def run(self):
         thread_last = threading.Thread(target=self.get_order_last_from_wind)
         thread_last.start()
+
+
+if __name__ == '__main__':
+    wl = WindLast()
+    wl.run()
