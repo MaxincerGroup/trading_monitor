@@ -6,12 +6,16 @@ import time
 import tkinter
 import tkinter.messagebox
 import exposure_monitoring
+import os
+from wind_last import WindLast
 
 flask_test = False
 wind_test = False
 schedule_test = False
 global_test = False
-upload_pseudo_postdata = True
+cmtimetest = False
+wind_last_test = True
+upload_pseudo_postdata = False
 
 if upload_pseudo_postdata:
     exposure_monitoring.dt_test_day = datetime.datetime.today()
@@ -32,8 +36,32 @@ if upload_pseudo_postdata:
     read_fmt.is_trading_time = False
     read_fmt.run()
 
-# 定时运行一段代码...愚蠢方法就是：while True: if time == '...': run(); else: time.sleep(2)
+# wind_last test
+if wind_last_test:
+    wl = WindLast()
+    wl.run()
+    gl_var = wl.global_var
+    gl_var.update_one({'Key': 'SecidQuery'}, {'$set': {'Value': None}}, upsert=True)
+    gl_var.update_one({'Key': 'Wcode2Last'}, {'$set': {'Value': None}}, upsert=True)
+    while True:
+        stock = ['510500.SH',  '000905.SH', '000300.SH', 'IC2009.CFE', 'IC2012.CFE']
+        gl_var.update_one({'Key': 'SecidQuery'}, {'$set': {'Value': stock}})
+        while gl_var.find_one({'Key': 'Wcode2Last'})['Value'] is None:
+            time.sleep(1)
+        print(gl_var.find_one({'Key': 'Wcode2Last'})['Value'])
+        time.sleep(30)
 
+# 获得修改时间（post处理方法）
+if cmtimetest:
+    mtime = time.ctime(os.path.getmtime('C:/Users/86133/Desktop/假装post/basic_info临时.xlsx'))
+    ctime = time.ctime(os.path.getctime('C:/Users/86133/Desktop/假装post/basic_info临时.xlsx'))
+    # getatime access time
+    # geta/c/mtime 输出时间戳 timestamp
+    # time.strftime('%Y%d%m', stamp)
+    print("Last modified : %s, last created time: %s" % (mtime, ctime))
+
+# 定时运行一段代码...愚蠢方法就是：while True: if time == '...': run(); else: time.sleep(2)
+# schedule就是自动考虑time interval的问题（sleep太久错过时间点）
 if schedule_test:
     def show_msg_tip():
         tkinter.messagebox.showinfo('提示', '该休息会儿了')
