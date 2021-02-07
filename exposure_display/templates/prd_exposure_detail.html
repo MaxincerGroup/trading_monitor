@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+    <meta charset="UTF-8">
+    <title>product exposure detail</title>
+    <link rel="stylesheet" type="text/css" href="../static/jquery-easyui-1.9.10/themes/default/easyui.css">
+    <link rel="stylesheet" type="text/css" href="../static/jquery-easyui-1.9.10/themes/icon.css">
+    <link rel="stylesheet" type="text/css" href="../static/jquery-easyui-1.9.10/css/demo.css">
+    <script type="text/javascript" src="../static/jquery-easyui-1.9.10/jquery.min.js"></script>
+    <script type="text/javascript" src="../static/jquery-easyui-1.9.10/jquery.easyui.min.js"></script>
+</head>
+<body>
+    <table class="easyui-datagrid" id="datatable" title="product exposure detail" style="width:100%;height:1000px"
+           data-options="singleSelect:true,collapsible:true">
+    </table>
+</body>
+<script type="text/javascript">
+    const intervalTime = 60000;
+
+    $("#datatable").datagrid(
+        {
+            title:'product exposure detail',
+            remoteSort:false,
+            rownumbers:true,
+            columns:[
+                [
+                    {field: 'DataDate', title: 'DataDate', sortable: true},
+                    {field: 'UpdateTime', title: 'UpdateTime', sortable: true},
+                    {field: 'PrdCode', title: 'PrdCode', sortable: true},
+                    {field: 'AcctIDByMXZ', title: 'AcctIDByMXZ', formatter: function(value){
+                        return '<a href="http://192.168.2.2:5000/account_position_detail/'+value+'" target="_blank">'+value+'</a>'}},
+                    {field: 'LongQty', title: 'LongQty', sortable: true},
+                    {field: 'ShortQty', title: 'ShortQty', sortable: true},
+                    {field: 'NetQty', title: 'NetQty', sortable: true},
+                    {field: 'LongAmt', title: 'LongAmt', sortable: true},
+                    {field: 'ShortAmt', title: 'ShortAmt', sortable: true},
+                    {field: 'NetAmt', title: 'NetAmt', sortable: true},
+                    {field: 'NetAsset', title: 'NetAsset', sortable: true},
+                    {field: 'NetAmt/NetAsset', title: 'NetAmt/NetAsset', sortable: true},
+                ]
+            ]
+        }
+    );
+
+    fun({{ prdcode }})
+    setInterval(fun, intervalTime);
+
+    function fun(prdcode) {
+        $.ajax(
+            {
+                type:"GET",
+                url:'/js_get_prd_exposure_detail/' + prdcode,
+                dataType:'json',
+                success:function (data){
+                    data=data.sort()
+                    $('#datatable').datagrid('loadData', data);
+                }
+            }
+        )
+    }
+</script>
+</html>
+

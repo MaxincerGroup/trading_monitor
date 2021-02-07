@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+    <meta charset="UTF-8">
+    <title>account position detail</title>
+    <link rel="stylesheet" type="text/css" href="../static/jquery-easyui-1.9.10/themes/default/easyui.css">
+    <link rel="stylesheet" type="text/css" href="../static/jquery-easyui-1.9.10/themes/icon.css">
+    <link rel="stylesheet" type="text/css" href="../static/jquery-easyui-1.9.10/css/demo.css">
+    <script type="text/javascript" src="../static/jquery-easyui-1.9.10/jquery.min.js"></script>
+    <script type="text/javascript" src="../static/jquery-easyui-1.9.10/jquery.easyui.min.js"></script>
+</head>
+<body>
+    <table class="easyui-datagrid" id="datatable" title="account position detail" style="width:100%;height:1000px"
+           data-options="singleSelect:true,collapsible:true">
+    </table>
+</body>
+<script type="text/javascript">
+    const intervalTime = 1000;
+
+    $("#datatable").datagrid(
+        {
+            title:'account position detail',
+            remoteSort:false,
+            rownumbers:true,
+            columns:[
+                [
+                    {field: 'DataDate', title: 'DataDate', sortable: true},
+                    {field: 'UpdateTime', title: 'UpdateTime', sortable: true},
+                    {field: 'AcctIDByMXZ', title: 'AcctIDByMXZ', sortable: true},
+                    {field: 'SecurityID', title: 'SecurityID', sortable: true},
+                    {field: 'LongQty', title: 'LongQty', sortable: true},
+                    {field: 'ShortQty', title: 'ShortQty', sortable: true},
+                    {field: 'NetQty', title: 'NetQty', sortable: true},
+                    {field: 'LongAmt', title: 'LongAmt', sortable: true},
+                    {field: 'ShortAmt', title: 'ShortAmt', sortable: true},
+                    {field: 'NetAmt', title: 'NetAmt', sortable: true},
+                ]
+            ]
+        }
+    );
+
+    fun({{acctid}})
+    setInterval(fun, intervalTime);
+
+    function fun(acctid) {
+        $.ajax(
+            {
+                type:"GET",
+                url:'/js_get_account_position_detail/' + acctid,
+                dataType:'json',
+                success:function (data){
+                    data=data.sort()
+                    $('#datatable').datagrid('loadData', data);
+                }
+            }
+        )
+    }
+    </script>
+</html>
+
